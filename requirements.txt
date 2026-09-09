@@ -1,0 +1,8 @@
+discord.py  
+groq
+aiohttp
+python-dotenv
+google-genai
+matplotlib
+networkx
+Pillow
