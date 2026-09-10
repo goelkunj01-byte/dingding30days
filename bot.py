@@ -97,6 +97,15 @@ GROQ_VISION_REASONING_KWARGS = {"reasoning_effort": "none", "reasoning_format": 
 # 400s on it ({"message": "`reasoning_effort` must be one of `none` or
 # `default`"}).
 GROQ_CHAT_REASONING_KWARGS = {"reasoning_effort": "none"}
+# BUG FIX: qwen/qwen3.6-27b's default max output length (~2048 tokens) blows
+# straight through the free/on-demand tier's Output Tokens Per Minute (OTPM)
+# limit of 1000 in a SINGLE request -- Groq rejects it outright with a 429
+# ("Request too large... Requested 2048... Limit 1000"), so ?talk and
+# ?bnstory failed on literally every message. Capping max_tokens well under
+# that limit fixes it. Applies to every call using GROQ_CHAT_MODEL or
+# GROQ_VISION_MODEL, since they're currently the same model and share the
+# same per-organization OTPM quota.
+GROQ_QWEN_MAX_TOKENS = 600
 
 # Create the client and start a chat session
 def get_groq_text(prompt):
@@ -114,6 +123,7 @@ def get_groq_text(prompt):
 def get_groq_vision_text(image_bytes: bytes, mime_type: str, prompt: str, temperature: Optional[float] = None) -> str:
     b64_data = base64.b64encode(image_bytes).decode("utf-8")
     kwargs = dict(GROQ_VISION_REASONING_KWARGS)
+    kwargs["max_tokens"] = GROQ_QWEN_MAX_TOKENS
     if temperature is not None:
         kwargs["temperature"] = temperature
     completion = groq_client.chat.completions.create(
@@ -212,6 +222,7 @@ def get_groq_chat_response(user_id: int, prompt: str) -> str:
     completion = groq_client.chat.completions.create(
         model=GROQ_CHAT_MODEL,
         messages=messages,
+        max_tokens=GROQ_QWEN_MAX_TOKENS,
         **GROQ_CHAT_REASONING_KWARGS,
     )
     reply = completion.choices[0].message.content
@@ -236,13 +247,6 @@ def track_talk_message(message_id: int, user_id: int):
     active_talk_messages[message_id] = user_id
     if len(active_talk_messages) > MAX_TRACKED_TALK_MESSAGES:
         active_talk_messages.popitem(last=False)  # drop oldest
-
-# NEW: tracks which messages have already had a reaction-triggered auto-caption
-# generated, so multiple people reacting 🤖 on the same image doesn't burn
-# quota re-captioning it every time. Doesn't need to survive a restart --
-# worst case after a redeploy is one message can be re-captioned once.
-captioned_message_ids = set()
-MAX_TRACKED_CAPTIONED_MESSAGES = 500
 
 # --------------------------------------------------------
 # --- BOT CONFIGURATION ---
@@ -270,7 +274,6 @@ SERVER_CONFIG_FILE = data_path('server_config.json')
 MARRIAGES_FILE = data_path('marriages.json')
 MARRIAGE_STATS_FILE = data_path('marriage_stats.json')
 FRIENDS_FILE = data_path('friends.json')
-HALL_OF_FAME_POSTED_FILE = data_path('hall_of_fame_posted.json')
 EMOJI_SPAM_FILE = data_path('emoji_spam.json')
 BIRTHDAY_ROLE_CLEANUP_FILE = data_path('birthday_role_cleanups.json')
 TRIGGERS_FILE = data_path('triggers.json')
@@ -307,9 +310,6 @@ GIPHY_API_KEY = os.getenv("GIPHY_API_KEY")
 STATUS_COMMAND_OWNERS = {"kanjuubarfiiii", "huh.ashh"}
 
 KALA_MAJDUR_IMAGE_PATH = "kala_majdur.jpg"
-
-HALL_OF_FAME_REACTION_THRESHOLD = 10
-HALL_OF_FAME_CHANNEL_ID_DEFAULT = "1438184520670253096"
 
 # NEW: emoji list used by ?poll to react with number emojis.
 NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -393,9 +393,6 @@ def get_guild_marriage_stats(guild_id) -> dict:
 def get_guild_friends(guild_id) -> dict:
     return friends.setdefault(str(guild_id), {})
 
-hall_of_fame_posted = load_data(HALL_OF_FAME_POSTED_FILE, default=[])
-if hall_of_fame_posted is None:
-    hall_of_fame_posted = []
 emoji_spam_targets = load_data(EMOJI_SPAM_FILE, default={})
 if emoji_spam_targets is None:
     emoji_spam_targets = {}
@@ -2094,35 +2091,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if not guild:
         return
 
-    # NEW: auto-caption is now opt-in via reaction instead of firing on every
-    # single image posted -- the bot still reacts 🤖 to every image (see
-    # on_message) as a hint that this is available, but the actual Gemini
-    # vision call (and its quota usage) only happens if someone reacts 🤖
-    # back, leaving far more of the daily quota available for ?rate.
-    if str(payload.emoji) == "🤖" and payload.user_id != bot.user.id:
-        if payload.message_id not in captioned_message_ids:
-            try:
-                channel = guild.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
-                message = await channel.fetch_message(payload.message_id)
-                image_attachments = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
-                if image_attachments:
-                    captioned_message_ids.add(payload.message_id)
-                    if len(captioned_message_ids) > MAX_TRACKED_CAPTIONED_MESSAGES:
-                        captioned_message_ids.pop()  # sets don't have FIFO order, but this keeps it bounded
-                    try:
-                        image_bytes = await image_attachments[0].read()
-                        mime_type = image_attachments[0].content_type
-                        caption_prompt = (
-                            "Look at this image and write one short, funny caption for it (max 20 words), "
-                            "like something you'd see under a meme. Output only the caption, nothing else."
-                        )
-                        caption = await asyncio.to_thread(get_gemini_vision_text, image_bytes, mime_type, caption_prompt)
-                        await message.reply(f"🤖 *{truncate_text(caption.strip(), 1900)}*")
-                    except Exception as e:
-                        print(f"⚠️ Auto-caption failed: {e}")
-            except Exception as e:
-                print(f"⚠️ Couldn't fetch message for reaction-triggered caption: {e}")
-
     if str(payload.emoji) == "📌":
         member = payload.member
         if member and not member.bot and member.guild_permissions.manage_messages:
@@ -2158,50 +2126,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                     save_data(memory_bank, MEMORY_BANK_FILE)
         except Exception as e:
             print(f"⚠️ Failed to save memory: {e}")
-
-    if str(payload.message_id) in hall_of_fame_posted:
-        return
-
-    try:
-        channel = guild.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
-        message = await channel.fetch_message(payload.message_id)
-    except Exception:
-        return
-
-    total_reactions = sum(r.count for r in message.reactions)
-    if total_reactions < HALL_OF_FAME_REACTION_THRESHOLD:
-        return
-
-    # NEW: if this server has whitelisted specific source channels (?addhofsource),
-    # only messages from those channels are eligible. If none are configured,
-    # every channel is eligible (old default -- keeps existing setups working).
-    hof_sources = server_config.get(str(guild.id), {}).get("hof_source_channel_ids")
-    if hof_sources and str(message.channel.id) not in hof_sources:
-        return
-
-    hof_channel = get_configured_channel(guild, "hall_of_fame_channel_id", HALL_OF_FAME_CHANNEL_ID_DEFAULT)
-    if not hof_channel:
-        return
-
-    embed = discord.Embed(
-        description=message.content or "*(no text content -- see attachment/embed below)*",
-        color=discord.Color.gold(),
-        timestamp=message.created_at
-    )
-    embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
-    embed.add_field(name="Reactions", value=f"⭐ {total_reactions}", inline=True)
-    embed.add_field(name="Jump to Message", value=f"[Click Here]({message.jump_url})", inline=True)
-    if message.attachments:
-        embed.set_image(url=message.attachments[0].url)
-
-    try:
-        await hof_channel.send(embed=embed)
-        hall_of_fame_posted.append(str(payload.message_id))
-        save_data(hall_of_fame_posted, HALL_OF_FAME_POSTED_FILE)
-    except discord.Forbidden:
-        print(f"⚠️ Missing permissions to post in the Hall of Fame channel in {guild.name}.")
-    except Exception as e:
-        print(f"⚠️ Hall of Fame post failed: {e}")
 
 @bot.event
 async def on_message(message):
@@ -2461,18 +2385,6 @@ async def on_message(message):
             except Exception as e:
                 print(f"⚠️ Failed to send trigger for '{phrase}': {e}")
             break
-
-    # UPDATED: no longer auto-captions every image on post -- that was
-    # burning through Gemini's daily quota fast. Now it just adds the 🤖
-    # reaction as a hint; the actual caption (see on_raw_reaction_add) only
-    # generates if someone reacts 🤖 back, which leaves way more quota
-    # available for ?rate.
-    image_attachments = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
-    if image_attachments:
-        try:
-            await message.add_reaction("🤖")
-        except Exception:
-            pass
 
     await bot.process_commands(message)
 
@@ -4728,13 +4640,12 @@ async def get_invite_link(ctx):
     embed.set_thumbnail(url=bot.user.display_avatar.url)
     await ctx.send(embed=embed)
 
-@bot.command(name="setchannel", usage="<birthday|leaderboard|hallfame|suggestions> [#channel]", help="[Mods only] Sets which channel a feature posts to on THIS server.")
+@bot.command(name="setchannel", usage="<birthday|leaderboard|suggestions> [#channel]", help="[Mods only] Sets which channel a feature posts to on THIS server.")
 @commands.has_permissions(manage_guild=True)
 async def set_feature_channel(ctx, feature: str, channel: discord.TextChannel = None):
     feature = feature.lower()
     key_map = {
         "birthday": "birthday_channel_id", "leaderboard": "leaderboard_channel_id",
-        "hallfame": "hall_of_fame_channel_id", "hall_of_fame": "hall_of_fame_channel_id",
         "suggestions": "suggestion_channel_id", "suggestion": "suggestion_channel_id",
         "welcome": "welcome_channel_id", "modlog": "mod_log_channel_id", "mod_log": "mod_log_channel_id",
         "ghostlog": "ghost_log_channel_id", "ghost_log": "ghost_log_channel_id",
@@ -4742,7 +4653,7 @@ async def set_feature_channel(ctx, feature: str, channel: discord.TextChannel = 
     }
     if feature not in key_map:
         return await ctx.send(
-            "❌ Feature must be one of: `birthday`, `leaderboard`, `hallfame`, `suggestions`, `welcome`, `modlog`, `ghostlog`, `eulogy`, `confessions`.\n"
+            "❌ Feature must be one of: `birthday`, `leaderboard`, `suggestions`, `welcome`, `modlog`, `ghostlog`, `eulogy`, `confessions`.\n"
             "Usage: `?setchannel birthday #general` (or just `?setchannel birthday` while sitting in the target channel)."
         )
     target_channel = channel or ctx.channel
@@ -4753,43 +4664,6 @@ async def set_feature_channel(ctx, feature: str, channel: discord.TextChannel = 
     save_data(server_config, SERVER_CONFIG_FILE)
     await ctx.send(f"✅ **{feature.capitalize()}** messages will now post in {target_channel.mention} on this server.")
     await send_mod_log(ctx.guild, "Server Config Changed", f"**Feature:** {feature}\n**Channel:** {target_channel.mention}", ctx.author)
-
-@bot.command(name="addhofsource", usage="#channel", help="[Mods only] Whitelists a channel so its messages can qualify for Hall of Fame. Once any channel is whitelisted, only whitelisted channels count.")
-@commands.has_permissions(manage_guild=True)
-async def add_hof_source(ctx, channel: discord.TextChannel):
-    gid = str(ctx.guild.id)
-    server_config.setdefault(gid, {}).setdefault("hof_source_channel_ids", [])
-    if str(channel.id) in server_config[gid]["hof_source_channel_ids"]:
-        return await ctx.send(f"❌ {channel.mention} is already whitelisted for Hall of Fame.")
-    server_config[gid]["hof_source_channel_ids"].append(str(channel.id))
-    save_data(server_config, SERVER_CONFIG_FILE)
-    await ctx.send(f"✅ {channel.mention} is now whitelisted -- its messages can qualify for Hall of Fame. Only whitelisted channels count from now on.")
-    await send_mod_log(ctx.guild, "Hall of Fame Source Added", f"**Channel:** {channel.mention}", ctx.author)
-
-@bot.command(name="removehofsource", usage="#channel", help="[Mods only] Removes a channel from the Hall of Fame whitelist.")
-@commands.has_permissions(manage_guild=True)
-async def remove_hof_source(ctx, channel: discord.TextChannel):
-    gid = str(ctx.guild.id)
-    sources = server_config.get(gid, {}).get("hof_source_channel_ids", [])
-    if str(channel.id) not in sources:
-        return await ctx.send(f"❌ {channel.mention} isn't on the Hall of Fame whitelist.")
-    sources.remove(str(channel.id))
-    save_data(server_config, SERVER_CONFIG_FILE)
-    note = " No channels are whitelisted now, so every channel is eligible again." if not sources else ""
-    await ctx.send(f"✅ Removed {channel.mention} from the Hall of Fame whitelist.{note}")
-    await send_mod_log(ctx.guild, "Hall of Fame Source Removed", f"**Channel:** {channel.mention}", ctx.author)
-
-@bot.command(name="listhofsources", help="Shows which channels are whitelisted for Hall of Fame on this server.")
-async def list_hof_sources(ctx):
-    sources = server_config.get(str(ctx.guild.id), {}).get("hof_source_channel_ids", [])
-    if not sources:
-        return await ctx.send("📭 No channels are whitelisted -- every channel is currently eligible for Hall of Fame.")
-    lines = []
-    for cid in sources:
-        ch = ctx.guild.get_channel(int(cid))
-        lines.append(ch.mention if ch else f"*(deleted channel {cid})*")
-    embed = discord.Embed(title="🌟 Hall of Fame Source Channels", description="\n".join(lines), color=discord.Color.gold())
-    await ctx.send(embed=embed)
 
 # --------------------------------------------------------
 # 🗣️ ?talk CHANNEL RESTRICTION (Mods only)
@@ -5216,11 +5090,10 @@ async def bot_setup_guide(ctx):
     if ctx.author.name.lower() not in CHATSBOT_ALLOWED_USERNAMES:
         return await ctx.send("❌ You're not permitted to use this command.")
     embed1 = discord.Embed(title="🛠️ New Server Setup Checklist (1/2)", description="Run these once, in the new server, right after inviting the bot with `?gl`.", color=discord.Color.blurple())
-    embed1.add_field(name="📌 Channels to create (or reuse existing ones)", value=("• A **welcome** channel\n• A **mod-log** channel (named exactly `mod-log` works automatically, or configure any name via `?setchannel modlog`)\n• A **ghost-ping log** channel (mods only)\n• A **general/leaderboard** channel\n• A **hall of fame** channel\n• A **birthday announcements** channel\n• A **suggestions** channel\n• An **eulogy** channel (optional)\n• A **confessions** channel (optional)"), inline=False)
-    embed1.add_field(name="⚙️ Then run `?setchannel <type> #channel` for each:", value="`welcome` `modlog` `ghostlog` `leaderboard` `hallfame` `birthday` `suggestions` `eulogy` `confessions`", inline=False)
+    embed1.add_field(name="📌 Channels to create (or reuse existing ones)", value=("• A **welcome** channel\n• A **mod-log** channel (named exactly `mod-log` works automatically, or configure any name via `?setchannel modlog`)\n• A **ghost-ping log** channel (mods only)\n• A **general/leaderboard** channel\n• A **birthday announcements** channel\n• A **suggestions** channel\n• An **eulogy** channel (optional)\n• A **confessions** channel (optional)"), inline=False)
+    embed1.add_field(name="⚙️ Then run `?setchannel <type> #channel` for each:", value="`welcome` `modlog` `ghostlog` `leaderboard` `birthday` `suggestions` `eulogy` `confessions`", inline=False)
     await ctx.send(embed=embed1)
     embed2 = discord.Embed(title="🛠️ New Server Setup Checklist (2/2)", color=discord.Color.blurple())
-    embed2.add_field(name="🌟 Hall of Fame (optional but recommended)", value="Run `?addhofsource #general` (or wherever) to restrict which channels' messages can qualify. Skip this to allow every channel.", inline=False)
     embed2.add_field(name="🎭 Self-roles", value="Run `?setup_roles` in whichever channel should host the role-picker menu.", inline=False)
     embed2.add_field(name="🗣️ ?talk restriction (optional)", value="If `?talk` should only work in specific channels, run `?restricttalk #channel` for each. Skip to leave it open everywhere.", inline=False)
     embed2.add_field(name="🔑 Environment variables to double-check on the host", value="`DISCORD_TOKEN`, `GROQ_API_KEY`, `GEMINI_API_KEY`, `DATA_DIR` (for persistent storage across redeploys), optionally `GIPHY_API_KEY`.", inline=False)
@@ -6948,6 +6821,7 @@ async def get_story_ai_reply(session: dict, user_message: Optional[str], conclud
         completion = groq_client.chat.completions.create(
             model=GROQ_CHAT_MODEL,
             messages=messages,
+            max_tokens=GROQ_QWEN_MAX_TOKENS,
             **GROQ_CHAT_REASONING_KWARGS,
         )
         return completion.choices[0].message.content
@@ -7563,7 +7437,6 @@ class HelpView(ui.View):
         embed.add_field(name="`?wrapped [user]`", value="A 'Spotify Wrapped'-style recap of a user's time in the server.", inline=False)
         embed.add_field(name="`?tldr [minutes]`", value="AI summarizes recent chat (default: last 60 minutes) so you can catch up fast.", inline=False)
         embed.add_field(name="`?onthisday`", value="Resurfaces a random message from this exact day in a previous year, in this channel.", inline=False)
-        embed.add_field(name="Auto-caption", value="Post any image and the bot reacts with 🤖. React 🤖 back on it (anyone can) to get an AI-generated funny caption -- only generates when someone actually wants one.", inline=False)
         embed.add_field(name="`?droll <count> <min>-<max>`", value="Rolls random numbers, then crowns whoever called one of them FIRST in recent chat.", inline=False)
         return embed
 
@@ -7690,13 +7563,10 @@ class HelpView(ui.View):
         embed.title = "⚙️ Server Setup (Mods only)"
         embed.description = "Configure which channel each feature posts to, ON THIS SERVER specifically. Needed once per server -- these features can't guess the right channel on their own."
         embed.add_field(
-            name='`?setchannel <birthday|leaderboard|hallfame|suggestions|welcome|modlog|ghostlog|eulogy|confessions> [#channel]`',
+            name='`?setchannel <birthday|leaderboard|suggestions|welcome|modlog|ghostlog|eulogy|confessions> [#channel]`',
             value="Sets the channel for that feature. Omit the channel to use the one you're typing in. `welcome` = join messages, `modlog` = warn/kick/ban/etc logs, `ghostlog` = deleted/edited ping alerts, `eulogy` = auto-posted send-off when someone leaves, `confessions` = anonymous confession posts.",
             inline=False
         )
-        embed.add_field(name="Hall of Fame threshold", value=f"Messages need **{HALL_OF_FAME_REACTION_THRESHOLD}** total reactions (any emoji, combined) to get reposted.", inline=False)
-        embed.add_field(name="`?addhofsource #channel` / `?removehofsource #channel`", value="Whitelist which channels' messages can qualify for Hall of Fame. If none whitelisted, every channel counts.", inline=False)
-        embed.add_field(name="`?listhofsources`", value="Shows the current Hall of Fame channel whitelist.", inline=False)
         embed.add_field(name="`?triggerchannel \"phrase\" [#channel]`", value="Restricts a trigger to only fire in one channel (omit channel to clear).", inline=False)
         embed.add_field(name="`?triggertransfer #source #destination` / `?removetriggertransfer #source`", value="Triggers typed in #source post their response in #destination instead.", inline=False)
         embed.add_field(name="`?restricttalk #channel` / `?unrestricttalk #channel`", value="Whitelist which channels `?talk` can be used in. If none whitelisted, it works everywhere.", inline=False)
