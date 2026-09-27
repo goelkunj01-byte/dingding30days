@@ -271,6 +271,7 @@ REMINDERS_FILE = data_path('reminders.json')
 MEMBER_HISTORY_FILE = data_path('member_history.json')
 BIRTHDAYS_FILE = data_path('birthdays.json')
 SERVER_CONFIG_FILE = data_path('server_config.json')
+DISABLED_SERVERS_FILE = data_path('disabled_servers.json')  # NEW: [guild_id, ...] -- servers where ?offbot has been used, bot goes fully silent there until ?onbot
 MARRIAGES_FILE = data_path('marriages.json')
 MARRIAGE_STATS_FILE = data_path('marriage_stats.json')
 FRIENDS_FILE = data_path('friends.json')
@@ -372,6 +373,9 @@ reminders_data = load_data(REMINDERS_FILE)
 member_history = load_data(MEMBER_HISTORY_FILE)
 birthdays = load_data(BIRTHDAYS_FILE)
 server_config = load_data(SERVER_CONFIG_FILE, default={})
+disabled_servers = load_data(DISABLED_SERVERS_FILE, default=[])  # NEW: [guild_id, ...] -- ?offbot kill switch
+if disabled_servers is None:
+    disabled_servers = []
 # BUG FIX: marriages/marriage_stats/friends used to be flat { user_id: ... }
 # dicts with no server dimension at all -- so ?marriages, ?couple, ?friendslist
 # etc showed data combined across every server the bot is in. Now nested as
@@ -1172,6 +1176,8 @@ async def timecapsule_check_loop_error(error):
 async def memory_resurface_loop():
     for guild in bot.guilds:
         gid = str(guild.id)
+        if gid in disabled_servers:
+            continue
         saved = memory_bank.get(gid, [])
         if not saved:
             continue
@@ -1232,8 +1238,11 @@ async def random_roast_loop():
     fires off a genuinely savage AI roast based on their ACTUAL recent
     messages. UPDATED: mods can now turn this off per-server with
     ?disableroast (see the command below) -- servers that have done so are
-    skipped entirely here."""
+    skipped entirely here. Also skips any server currently turned off via
+    ?offbot."""
     for guild in bot.guilds:
+        if str(guild.id) in disabled_servers:
+            continue
         if server_config.get(str(guild.id), {}).get("random_roast_disabled"):
             continue
 
@@ -1300,6 +1309,8 @@ async def weekly_leaderboard_announcement():
 
     global message_counts
     for guild_id_str, counts in message_counts.items():
+        if guild_id_str in disabled_servers:
+            continue
         guild = bot.get_guild(int(guild_id_str))
         if not guild: continue
 
@@ -1423,6 +1434,8 @@ async def birthday_check_loop():
 
         user_id = int(user_id_str)
         for guild in bot.guilds:
+            if str(guild.id) in disabled_servers:
+                continue
             member = guild.get_member(user_id)
             if member:
                 issues = await celebrate_birthday(guild, member, bday)
@@ -2133,6 +2146,21 @@ async def on_message(message):
         await bot.process_commands(message)
         return
 
+    # NEW: instant per-server kill switch (?offbot / ?onbot). Checked before
+    # ANYTHING else runs -- AFK, control channel, spam tracking, triggers,
+    # AI, everything -- so the bot goes fully silent in that server the
+    # moment it's off. Only ?onbot, from the exact allowed username, gets
+    # through while disabled. (DMs never hit this since message.guild is
+    # None there, and are handled by the early return above.)
+    gid_check = str(message.guild.id)
+    if gid_check in disabled_servers:
+        content_lower_check = message.content.strip().lower()
+        onbot_cmd = f"{bot.command_prefix}onbot"
+        is_onbot = content_lower_check == onbot_cmd or content_lower_check.startswith(onbot_cmd + " ")
+        if is_onbot and message.author.name == BOT_TOGGLE_ALLOWED_USERNAME:
+            await bot.process_commands(message)
+        return
+
     content = message.content
     content_lower = content.lower()
 
@@ -2159,15 +2187,6 @@ async def on_message(message):
             except Exception:
                 pass
             await message.channel.send(f"❌ {message.author.mention}, only server Administrators can issue instructions in this channel.", delete_after=10)
-        return
-
-    if content.strip() == bot.command_prefix:
-        suggestions = ["talk", "rate", "help", "ping", "afk", "leaderboard", "profile", "create"]
-        suggestion_text = "  •  ".join(f"`{bot.command_prefix}{cmd}`" for cmd in suggestions)
-        await message.channel.send(
-            f"👋 Try one of these, or use `{bot.command_prefix}help` to see everything:\n{suggestion_text}",
-            delete_after=15
-        )
         return
 
     # NEW: ?bnstory active roleplay -- if this message is inside an active
@@ -4803,7 +4822,7 @@ async def allow_type_pvt_channel(ctx, member: discord.Member):
     if member.id not in record["type"]:
         record["type"].append(member.id)
     save_data(private_channels, PRIVATE_CHANNELS_FILE)
-    await ctx.send(f"⌨️ {member.mention} can now type in this channel.")
+    await ctx.send(f"✍️ {member.mention} can now see and write in this story!")
 
 @bot.command(name="disallowin", usage="@user", help="[Run inside your private channel] Removes a user's access to your private channel entirely.")
 async def disallow_in_pvt_channel(ctx, member: discord.Member):
@@ -4961,6 +4980,7 @@ async def admin_dms_info(ctx):
     embed.add_field(name="`?av [user]` / `/av [user]`", value="Shows your avatar, or any user's (by mention/ID) if we share a server.", inline=False)
     embed.add_field(name="`?rate [user]` / `/rate [user]`", value="AI-rates an avatar. Limited to once a day per person -- shared between prefix and slash use, not separate limits.", inline=False)
     embed.add_field(name="`?afk [reason]` / `/afk [reason]`", value="Sets you AFK across every server we both share, all at once.", inline=False)
+    embed.add_field(name="`?offbot [server_id]` / `?onbot [server_id]`", value="[Owner only] Turns the bot off/back on in a server. From DM, the server_id is required since there's no server context.", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command(name="addav", usage="@user (attach an image)", help="[Mods only] Sets a custom avatar override for a user -- shows on ?av everywhere this bot is, until a mod removes it.")
@@ -5067,6 +5087,90 @@ async def idle(ctx):
     current_bot_status = discord.Status.idle
     await bot.change_presence(status=current_bot_status, activity=current_bot_activity)
     await ctx.send("🌙 Status changed to **Idle**.")
+
+# --------------------------------------------------------
+# 🔴 INSTANT PER-SERVER KILL SWITCH (?offbot / ?onbot)
+# --------------------------------------------------------
+BOT_TOGGLE_ALLOWED_USERNAME = "kanjuubarfiiii"  # exact Discord username (@handle) match, nobody else -- case-sensitive, nickname does NOT count
+
+def find_announce_channel(ctx, guild: discord.Guild) -> Optional[discord.abc.Messageable]:
+    """Picks where to post the offbot/onbot announcement: the channel the
+    command was run in (if run inside that server), else the configured
+    mod-log channel, else the system channel, else the first text channel
+    the bot can actually send in."""
+    if ctx.guild and ctx.guild.id == guild.id:
+        return ctx.channel
+    channel = get_mod_log_channel(guild)
+    if channel:
+        return channel
+    if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
+        return guild.system_channel
+    for ch in guild.text_channels:
+        if ch.permissions_for(guild.me).send_messages:
+            return ch
+    return None
+
+@bot.command(name="offbot", usage="[server_id]", help="[Owner only] Instantly stops the bot in a server. Run in-server (defaults to that server), or DM the bot with a server_id.")
+async def off_bot(ctx, server_id: Optional[int] = None):
+    if ctx.author.name != BOT_TOGGLE_ALLOWED_USERNAME:
+        return await ctx.send("❌ You're not permitted to use this command.")
+
+    target_guild_id = server_id or (ctx.guild.id if ctx.guild else None)
+    if target_guild_id is None:
+        return await ctx.send("❌ Run this in the server you want to turn off, or specify the ID: `?offbot <server_id>` (works in DM too).")
+
+    guild = bot.get_guild(target_guild_id)
+    if not guild:
+        return await ctx.send(f"❌ I'm not in a server with ID `{target_guild_id}`.")
+
+    gid_str = str(guild.id)
+    if gid_str in disabled_servers:
+        return await ctx.send(f"❌ The bot is already turned off in **{guild.name}**.")
+
+    disabled_servers.append(gid_str)
+    save_data(disabled_servers, DISABLED_SERVERS_FILE)
+
+    announce_channel = find_announce_channel(ctx, guild)
+    if announce_channel:
+        try:
+            await announce_channel.send("🔴 This bot has been turned **off** for this server and won't respond to anything until it's turned back on.")
+        except Exception as e:
+            print(f"⚠️ Couldn't post the offbot announcement in {guild.name}: {e}")
+
+    if ctx.guild is None or ctx.guild.id != guild.id:
+        note = "" if announce_channel else " (couldn't find a channel there to announce it in, though)"
+        await ctx.send(f"🔴 Bot turned **off** in **{guild.name}**.{note}")
+
+@bot.command(name="onbot", usage="[server_id]", help="[Owner only] Turns the bot back on in a server. Run in-server (defaults to that server), or DM the bot with a server_id.")
+async def on_bot(ctx, server_id: Optional[int] = None):
+    if ctx.author.name != BOT_TOGGLE_ALLOWED_USERNAME:
+        return await ctx.send("❌ You're not permitted to use this command.")
+
+    target_guild_id = server_id or (ctx.guild.id if ctx.guild else None)
+    if target_guild_id is None:
+        return await ctx.send("❌ Run this in the server you want to turn back on, or specify the ID: `?onbot <server_id>` (works in DM too).")
+
+    guild = bot.get_guild(target_guild_id)
+    if not guild:
+        return await ctx.send(f"❌ I'm not in a server with ID `{target_guild_id}`.")
+
+    gid_str = str(guild.id)
+    if gid_str not in disabled_servers:
+        return await ctx.send(f"❌ The bot is already on in **{guild.name}**.")
+
+    disabled_servers.remove(gid_str)
+    save_data(disabled_servers, DISABLED_SERVERS_FILE)
+
+    announce_channel = find_announce_channel(ctx, guild)
+    if announce_channel:
+        try:
+            await announce_channel.send("🟢 This bot has been turned back **on** for this server.")
+        except Exception as e:
+            print(f"⚠️ Couldn't post the onbot announcement in {guild.name}: {e}")
+
+    if ctx.guild is None or ctx.guild.id != guild.id:
+        note = "" if announce_channel else " (couldn't find a channel there to announce it in, though)"
+        await ctx.send(f"🟢 Bot turned back **on** in **{guild.name}**.{note}")
 
 CHATSBOT_ALLOWED_USERNAMES = {"kanjuubarfiiii"}
 
@@ -6368,7 +6472,6 @@ async def who_would_you(ctx):
 # --------------------------------------------------------
 # 📸 CAPTION BATTLE
 # --------------------------------------------------------
-# --------------------------------------------------------
 active_caption_battles = {}
 CAPTION_BATTLE_IMAGE_PROMPTS = [
     "a raccoon wearing a business suit giving a presentation, digital art",
@@ -7546,8 +7649,9 @@ class HelpView(ui.View):
 
     def get_owner_page(self, embed):
         embed.title = "👑 Owner Commands"
-        embed.description = "Exclusive for **kanjuubarfiiii** and **huh.ashh**."
+        embed.description = "Exclusive for **kanjuubarfiiii** and **huh.ashh** (a couple listed here are kanjuubarfiiii only, see below)."
         embed.add_field(name="`?online` / `?idle` / `?dnd`", value="Change the bot's status icon.", inline=False)
+        embed.add_field(name="`?offbot [server_id]` / `?onbot [server_id]`", value="[**kanjuubarfiiii only**, exact username match] Instantly turns the bot off/back on in a server. Run inside the target server (defaults to it), or DM the bot with a server ID to control any server it's in. Posts a 🔴/🟢 announcement in that server when toggled.", inline=False)
         return embed
 
     def get_bot_identity_page(self, embed):
