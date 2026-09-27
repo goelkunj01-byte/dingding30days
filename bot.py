@@ -5425,14 +5425,25 @@ async def setup_server(ctx):
             if item.get("public_read_only"):
                 overwrites[everyone] = discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=True)
 
+            # BUG FIX: discord.py's create_*_channel validates overwrites as
+            # "must be an actual dict, or omitted entirely" -- passing None
+            # explicitly (which `overwrites or None` did whenever a channel
+            # had no special permissions, i.e. almost all of them) raised
+            # "overwrites parameter expects a dict." and aborted that channel.
+            # Only including the kwarg when there's actually something in it
+            # avoids ever passing None.
+            create_kwargs = {"category": category, "reason": "?setupsvr"}
+            if overwrites:
+                create_kwargs["overwrites"] = overwrites
+
             if item["type"] == "voice":
                 channel = await create_with_retries(
-                    lambda: guild.create_voice_channel(name, category=category, overwrites=overwrites or None, reason="?setupsvr"),
+                    lambda: guild.create_voice_channel(name, **create_kwargs),
                     f"voice channel: {name}"
                 )
             else:
                 channel = await create_with_retries(
-                    lambda: guild.create_text_channel(name, category=category, overwrites=overwrites or None, reason="?setupsvr"),
+                    lambda: guild.create_text_channel(name, **create_kwargs),
                     f"text channel: {name}"
                 )
 
