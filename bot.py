@@ -5205,6 +5205,254 @@ async def bot_setup_guide(ctx):
     await ctx.send(embed=embed2)
 
 # --------------------------------------------------------
+# 🏗️ ONE-COMMAND SERVER SETUP (?setupsvr)
+# --------------------------------------------------------
+# Builds an entire category/channel layout in one go and wires every bot
+# feature up to point at what it just created -- meant for a brand new or
+# mostly-empty server. Text channel names get a light unicode font treatment
+# (Mathematical Sans-Serif look-alikes) plus one emoji and a middle dot, e.g.
+# "🎨・𝖺𝗋𝗍" -- Discord only forces STANDARD ascii letters to lowercase, so
+# these unicode look-alikes pass straight through untouched. Kept to one
+# emoji + one separator per channel on purpose, no stacked symbols, so it
+# reads as clean/stylish rather than cluttered. Voice channel names are left
+# in normal mixed-case text (Discord shows voice channel names as typed,
+# unlike text channels) with just a leading emoji.
+
+_STYLISH_FONT_MAP = {}
+for _i, _ch in enumerate("abcdefghijklmnopqrstuvwxyz"):
+    _STYLISH_FONT_MAP[_ch] = chr(0x1D5BA + _i)   # Mathematical Sans-Serif small letters
+for _i, _ch in enumerate("0123456789"):
+    _STYLISH_FONT_MAP[_ch] = chr(0x1D7E2 + _i)   # Mathematical Sans-Serif digits
+
+def stylish(text: str) -> str:
+    """Converts plain ascii text (letters/digits only affected) into the
+    Mathematical Sans-Serif unicode look-alike font used for channel names."""
+    return "".join(_STYLISH_FONT_MAP.get(c, c) for c in text.lower())
+
+def format_channel_name(item: dict) -> str:
+    if item["type"] == "voice":
+        return f'{item["emoji"]} {item["name"]}'
+    return f'{item["emoji"]}・{stylish(item["name"])}'
+
+# Blueprint: each category lists its channels. "key" is how the created
+# channel gets looked up afterward (to wire up ?setchannel-equivalents, jail,
+# self-roles, etc). "public_read_only" marks a channel where @everyone can
+# view but not type (rules/announcements/welcome-style). "staff_only" on a
+# category hides the whole category from @everyone.
+SERVER_SETUP_BLUEPRINT = {
+    "categories": [
+        {
+            "name": "🔰 Entrance",
+            "channels": [
+                {"type": "text", "key": "rules", "name": "rules", "emoji": "📜", "public_read_only": True},
+                {"type": "text", "key": "announcements", "name": "announcements", "emoji": "📢", "public_read_only": True},
+                {"type": "text", "key": "welcome", "name": "welcome", "emoji": "👋", "public_read_only": True},
+                {"type": "text", "key": "self_roles", "name": "self-role", "emoji": "🎭"},
+                {"type": "text", "key": "suggestions", "name": "suggestions", "emoji": "📝"},
+            ],
+        },
+        {
+            "name": "💬 Text World",
+            "channels": [
+                {"type": "text", "key": "general", "name": "general", "emoji": "💬"},
+                {"type": "text", "key": "bot", "name": "bot", "emoji": "🤖"},
+                {"type": "text", "key": "spam", "name": "spam", "emoji": "🗑️"},
+                {"type": "text", "key": "shame", "name": "shame", "emoji": "🙈"},
+                {"type": "text", "key": "confession", "name": "confession", "emoji": "🤫"},
+                {"type": "text", "key": "eulogy", "name": "eulogy", "emoji": "🕊️"},
+            ],
+        },
+        {
+            "name": "🌸 Media",
+            "channels": [
+                {"type": "text", "key": "art", "name": "art", "emoji": "🎨"},
+                {"type": "text", "key": "pfp", "name": "pfp", "emoji": "🖼️"},
+                {"type": "text", "key": "flex", "name": "flex", "emoji": "💪"},
+                {"type": "text", "key": "foodies", "name": "foodies", "emoji": "🍔"},
+                {"type": "text", "key": "trash", "name": "trash", "emoji": "🚮"},
+                {"type": "text", "key": "media", "name": "media", "emoji": "📸"},
+            ],
+        },
+        {
+            "name": "🎲 Games",
+            "channels": [
+                {"type": "text", "key": "dank", "name": "dank", "emoji": "💵"},
+                {"type": "text", "key": "owo", "name": "owo", "emoji": "🦉"},
+                {"type": "text", "key": "bot_game", "name": "bot-game", "emoji": "🕹️"},
+            ],
+        },
+        {
+            "name": "🎵 Music World",
+            "channels": [
+                {"type": "text", "key": "music", "name": "music-1", "emoji": "🎶"},
+            ],
+        },
+        {
+            "name": "🔊 Vc World",
+            "channels": [
+                {"type": "voice", "key": "vc_general", "name": "General VC", "emoji": "🎙️"},
+                {"type": "voice", "key": "vc_samajik", "name": "Samajik Baate", "emoji": "🗣️"},
+                {"type": "voice", "key": "vc_kutto", "name": "Kutto Ka VC", "emoji": "🐶"},
+                {"type": "voice", "key": "vc_chai", "name": "Chai Ki Tapri", "emoji": "☕"},
+                {"type": "voice", "key": "vc_movie", "name": "Movie Time", "emoji": "🎬"},
+            ],
+        },
+        {
+            "name": "🛡️ Staff Only",
+            "staff_only": True,
+            "channels": [
+                {"type": "text", "key": "mod_chat", "name": "mod-chat", "emoji": "🔒"},
+                {"type": "text", "key": "mod_log", "name": "mod-log", "emoji": "📋"},
+                {"type": "text", "key": "ghost_log", "name": "ghost-log", "emoji": "👻"},
+                {"type": "text", "key": "control_room", "name": "control-room", "emoji": "🗳️"},
+                {"type": "text", "key": "jail", "name": "jail", "emoji": "🚔"},
+            ],
+        },
+    ]
+}
+
+@bot.command(
+    name="setupsvr", aliases=["setupserver"],
+    help="[Admins only] Fully sets up a server in one go: creates a full stylish category/channel layout (entrance, text/media/games/music/VC channels, a hidden staff-only category) and auto-configures every bot feature to point at what it just made -- welcome, mod-log, ghost-log, birthday, suggestions, eulogy, confessions, control channel, jail, and self-roles."
+)
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(manage_channels=True, manage_roles=True)
+async def setup_server(ctx):
+    guild = ctx.guild
+    gid = str(guild.id)
+
+    confirm_msg = await ctx.send(
+        "⚠️ This will create a full set of categories and channels in this server (rules, "
+        "announcements, general chat, media, games, music, voice channels, and a hidden "
+        "staff-only category), then point every bot feature at them automatically. It only "
+        "**adds** channels -- it won't touch or delete anything that already exists -- but it's "
+        "meant for a fresh/mostly-empty server. React ✅ within 30 seconds to continue, or ❌ to cancel."
+    )
+    await confirm_msg.add_reaction("✅")
+    await confirm_msg.add_reaction("❌")
+
+    def check(reaction, user):
+        return user.id == ctx.author.id and reaction.message.id == confirm_msg.id and str(reaction.emoji) in ("✅", "❌")
+
+    try:
+        reaction, _ = await bot.wait_for("reaction_add", timeout=30.0, check=check)
+    except asyncio.TimeoutError:
+        return await ctx.send("⌛ Timed out -- run `?setupsvr` again when you're ready.")
+
+    if str(reaction.emoji) == "❌":
+        return await ctx.send("❌ Server setup cancelled.")
+
+    status_msg = await ctx.send("⚙️ Setting up your server... this can take a minute, please don't run other commands meanwhile.")
+
+    created = {}  # blueprint key -> created channel object
+    everyone = guild.default_role
+
+    # Any role that can already moderate (Administrator/Manage Server/Manage
+    # Messages) gets to see the staff-only category automatically -- so if
+    # this server already has a mod role, they're not accidentally locked out.
+    staff_roles = [
+        r for r in guild.roles
+        if r != everyone and (r.permissions.administrator or r.permissions.manage_guild or r.permissions.manage_messages)
+    ]
+
+    try:
+        for cat_data in SERVER_SETUP_BLUEPRINT["categories"]:
+            is_staff = cat_data.get("staff_only", False)
+            cat_overwrites = {}
+            if is_staff:
+                cat_overwrites[everyone] = discord.PermissionOverwrite(view_channel=False)
+                cat_overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+                for r in staff_roles:
+                    cat_overwrites[r] = discord.PermissionOverwrite(view_channel=True)
+
+            category = await guild.create_category(cat_data["name"], overwrites=cat_overwrites, reason="?setupsvr")
+
+            for item in cat_data["channels"]:
+                name = format_channel_name(item)
+                overwrites = {}
+                if item.get("public_read_only"):
+                    overwrites[everyone] = discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=True)
+
+                if item["type"] == "voice":
+                    channel = await guild.create_voice_channel(name, category=category, overwrites=overwrites or None, reason="?setupsvr")
+                else:
+                    channel = await guild.create_text_channel(name, category=category, overwrites=overwrites or None, reason="?setupsvr")
+
+                created[item["key"]] = channel
+    except discord.Forbidden:
+        return await status_msg.edit(content="❌ I lost permission partway through (need **Manage Channels**) -- whatever was already created is still there, but setup couldn't finish. Fix my permissions and run `?setupsvr` again; it'll just add what's still missing... though note it doesn't check for duplicates, so re-running will create a second set.")
+    except Exception as e:
+        return await status_msg.edit(content=f"❌ Something went wrong while creating channels: {e}")
+
+    # --- Auto-configure every bot feature to point at what was just made ---
+    server_config.setdefault(gid, {})
+    channel_key_map = {
+        "welcome_channel_id": "welcome",
+        "mod_log_channel_id": "mod_chat",
+        "ghost_log_channel_id": "ghost_log",
+        "leaderboard_channel_id": "general",
+        "birthday_channel_id": "announcements",
+        "suggestion_channel_id": "suggestions",
+        "eulogy_channel_id": "eulogy",
+        "confessions_channel_id": "confession",
+        "control_channel_id": "control_room",
+        "jail_channel_id": "jail",
+    }
+    for config_key, blueprint_key in channel_key_map.items():
+        ch = created.get(blueprint_key)
+        if ch:
+            server_config[gid][config_key] = str(ch.id)
+    save_data(server_config, SERVER_CONFIG_FILE)
+
+    # Wire up the jail system: create/get the Jailed role and lock it out of
+    # every channel except the new jail channel (same as ?setjailchannel).
+    jail_note = ""
+    jail_channel = created.get("jail")
+    if jail_channel:
+        role = await get_or_create_jail_role(guild)
+        if role:
+            await apply_jail_overwrites(guild, role, str(jail_channel.id))
+            jail_note = f"🔒 Jail system ready -- `?jail @user` now works, releases go through {jail_channel.mention}."
+        else:
+            jail_note = "⚠️ Couldn't set up the Jailed role automatically (missing Manage Roles) -- run `?setjailchannel` again once that's fixed."
+
+    # Post the self-role menu (using whatever categories this guild already
+    # has configured -- built-ins the first time) into the self-roles channel.
+    role_note = ""
+    self_role_channel = created.get("self_roles")
+    if self_role_channel:
+        categories = get_guild_role_categories(guild.id)
+        non_empty = {name: roles for name, roles in categories.items() if roles}
+        if non_empty:
+            for chunk in chunk_categories(non_empty, size=5):
+                await self_role_channel.send(
+                    embed=discord.Embed(
+                        title="🎭 Choose Your Roles",
+                        description="Pick from the dropdowns below -- your selections apply instantly and privately.",
+                        color=0x5865F2
+                    ),
+                    view=DynamicRolePicker(chunk)
+                )
+            role_note = f"🎭 Self-role menu posted in {self_role_channel.mention}."
+
+    summary_lines = [
+        f"✅ **Server setup complete!** Created {len(created)} channels across {len(SERVER_SETUP_BLUEPRINT['categories'])} categories.",
+        "⚙️ Auto-configured: welcome, mod-log, ghost-log, leaderboard, birthday, suggestions, eulogy, confessions, and the control channel.",
+    ]
+    if jail_note:
+        summary_lines.append(jail_note)
+    if role_note:
+        summary_lines.append(role_note)
+    summary_lines.append(
+        "\n📌 Rules/announcements/welcome are read-only for @everyone, the **Staff Only** category "
+        "is hidden from @everyone (visible to any role with Manage Server/Messages or Administrator), "
+        "and everything else is open to talk in. Adjust any of it by hand any time -- this is just a "
+        "starting layout, not locked in."
+    )
+    await status_msg.edit(content="\n".join(summary_lines))
+    await send_mod_log(guild, "Server Setup Run", f"Full server layout created and configured by {ctx.author.mention} via `?setupsvr`.", ctx.author)
+
+# --------------------------------------------------------
 # 🤖 BOT IDENTITY COMMANDS (Admins only)
 # --------------------------------------------------------
 
@@ -7678,6 +7926,7 @@ class HelpView(ui.View):
         embed.add_field(name="`?setjailchannel #channel`", value="Sets the jail channel and locks the Jailed role out of every other channel (text + voice). Set the channel's own visibility (hidden from regular members, visible to mods) yourself first.", inline=False)
         embed.add_field(name="`?setcontrolchannel #channel`", value="[Admins only] Designates a channel where plain-English instructions (e.g. `timeout @user for 1 hour`, `unjail @user after 10 mins`) get carried out automatically by an AI parser.", inline=False)
         embed.add_field(name="`?disableroast` / `?enableroast`", value="Turns the automatic ~6-hourly random roast off/on for this server.", inline=False)
+        embed.add_field(name="`?setupsvr` (`?setupserver`)", value="[Admins only] One-shot full server setup -- builds a stylish category/channel layout (entrance, text/media/games/music, voice channels, a hidden staff-only category) and auto-configures every one of the settings above to point at it. Best run on a fresh/empty server.", inline=False)
         return embed
 
     @ui.button(label="<", style=discord.ButtonStyle.primary)
