@@ -5313,7 +5313,7 @@ SERVER_SETUP_BLUEPRINT = {
 
 @bot.command(
     name="setupsvr", aliases=["setupserver"],
-    help="[Admins only] Fully sets up a server in one go: creates a full stylish category/channel layout (entrance, text/media/games/music/VC channels, a hidden staff-only category) and auto-configures every bot feature to point at what it just made -- welcome, mod-log, ghost-log, birthday, suggestions, eulogy, confessions, control channel, jail, and self-roles."
+    help="[Admins only] Fully sets up a server in one go: creates a full stylish category/channel layout (entrance, text/media/games/music/VC channels, a hidden staff-only category) and auto-configures every bot feature to point at what it just made -- welcome, mod-log, ghost-log, birthday, suggestions, eulogy, confessions, control channel, jail, and self-roles. Safe to re-run -- it skips anything that already exists instead of duplicating it, and retries automatically if Discord rate-limits channel creation (common right after a server is first created)."
 )
 @commands.has_permissions(administrator=True)
 @commands.bot_has_permissions(manage_channels=True, manage_roles=True)
@@ -5325,8 +5325,9 @@ async def setup_server(ctx):
         "⚠️ This will create a full set of categories and channels in this server (rules, "
         "announcements, general chat, media, games, music, voice channels, and a hidden "
         "staff-only category), then point every bot feature at them automatically. It only "
-        "**adds** channels -- it won't touch or delete anything that already exists -- but it's "
-        "meant for a fresh/mostly-empty server. React ✅ within 30 seconds to continue, or ❌ to cancel."
+        "**adds** channels, and skips anything that already exists by name -- so it's safe to "
+        "re-run if it gets interrupted (e.g. by Discord's new-server rate limit, see below). "
+        "React ✅ within 30 seconds to continue, or ❌ to cancel."
     )
     await confirm_msg.add_reaction("✅")
     await confirm_msg.add_reaction("❌")
@@ -5342,9 +5343,11 @@ async def setup_server(ctx):
     if str(reaction.emoji) == "❌":
         return await ctx.send("❌ Server setup cancelled.")
 
-    status_msg = await ctx.send("⚙️ Setting up your server... this can take a minute, please don't run other commands meanwhile.")
+    status_msg = await ctx.send("⚙️ Setting up your server... 0 channels done so far.")
 
-    created = {}  # blueprint key -> created channel object
+    created = {}       # blueprint key -> channel object (newly made or reused)
+    skipped_existing = []  # names that already existed and were reused as-is
+    failed = []         # (label, reason) for anything that never got created
     everyone = guild.default_role
 
     # Any role that can already moderate (Administrator/Manage Server/Manage
@@ -5355,9 +5358,43 @@ async def setup_server(ctx):
         if r != everyone and (r.permissions.administrator or r.permissions.manage_guild or r.permissions.manage_messages)
     ]
 
-    try:
-        for cat_data in SERVER_SETUP_BLUEPRINT["categories"]:
-            is_staff = cat_data.get("staff_only", False)
+    async def create_with_retries(coro_factory, label: str, max_attempts: int = 4):
+        """Runs a create_* call, retrying with backoff specifically on 429s
+        (rate limited) -- Discord throttles rapid channel creation hard on
+        brand-new servers, which previously aborted the whole command on the
+        very first hit. Returns the created object, or None if it never
+        succeeds (appended to `failed` with the reason)."""
+        delay = 2.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await coro_factory()
+            except discord.HTTPException as e:
+                if e.status == 429 and attempt < max_attempts:
+                    retry_after = getattr(e, "retry_after", None) or delay
+                    print(f"⚠️ ?setupsvr rate limited creating '{label}', waiting {retry_after:.1f}s (attempt {attempt}/{max_attempts})")
+                    await asyncio.sleep(retry_after + 0.5)
+                    delay *= 2
+                    continue
+                failed.append((label, f"Discord error ({e.status}): {e.text[:120] if e.text else 'rate limited repeatedly'}"))
+                return None
+            except discord.Forbidden:
+                failed.append((label, "missing permission"))
+                return None
+            except Exception as e:
+                failed.append((label, str(e)[:150]))
+                return None
+        return None
+
+    total_categories = len(SERVER_SETUP_BLUEPRINT["categories"])
+    for cat_index, cat_data in enumerate(SERVER_SETUP_BLUEPRINT["categories"], 1):
+        cat_display_name = cat_data["name"]
+        is_staff = cat_data.get("staff_only", False)
+
+        # Reuse an existing category with the same name instead of making a
+        # duplicate -- this is what makes re-running after a partial failure
+        # safe rather than piling up copies.
+        category = discord.utils.get(guild.categories, name=cat_display_name)
+        if category is None:
             cat_overwrites = {}
             if is_staff:
                 cat_overwrites[everyone] = discord.PermissionOverwrite(view_channel=False)
@@ -5365,24 +5402,48 @@ async def setup_server(ctx):
                 for r in staff_roles:
                     cat_overwrites[r] = discord.PermissionOverwrite(view_channel=True)
 
-            category = await guild.create_category(cat_data["name"], overwrites=cat_overwrites, reason="?setupsvr")
+            category = await create_with_retries(
+                lambda: guild.create_category(cat_display_name, overwrites=cat_overwrites, reason="?setupsvr"),
+                f"category: {cat_display_name}"
+            )
+            await asyncio.sleep(0.8)  # small gap between creates to stay clear of Discord's burst limit
 
-            for item in cat_data["channels"]:
-                name = format_channel_name(item)
-                overwrites = {}
-                if item.get("public_read_only"):
-                    overwrites[everyone] = discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=True)
+        if category is None:
+            # Couldn't make (or find) this category at all -- skip its channels,
+            # they'll get picked up on a re-run once the category exists.
+            continue
 
-                if item["type"] == "voice":
-                    channel = await guild.create_voice_channel(name, category=category, overwrites=overwrites or None, reason="?setupsvr")
-                else:
-                    channel = await guild.create_text_channel(name, category=category, overwrites=overwrites or None, reason="?setupsvr")
+        for item in cat_data["channels"]:
+            name = format_channel_name(item)
+            existing = discord.utils.get(category.channels, name=name)
+            if existing is not None:
+                created[item["key"]] = existing
+                skipped_existing.append(name)
+                continue
 
+            overwrites = {}
+            if item.get("public_read_only"):
+                overwrites[everyone] = discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=True)
+
+            if item["type"] == "voice":
+                channel = await create_with_retries(
+                    lambda: guild.create_voice_channel(name, category=category, overwrites=overwrites or None, reason="?setupsvr"),
+                    f"voice channel: {name}"
+                )
+            else:
+                channel = await create_with_retries(
+                    lambda: guild.create_text_channel(name, category=category, overwrites=overwrites or None, reason="?setupsvr"),
+                    f"text channel: {name}"
+                )
+
+            if channel:
                 created[item["key"]] = channel
-    except discord.Forbidden:
-        return await status_msg.edit(content="❌ I lost permission partway through (need **Manage Channels**) -- whatever was already created is still there, but setup couldn't finish. Fix my permissions and run `?setupsvr` again; it'll just add what's still missing... though note it doesn't check for duplicates, so re-running will create a second set.")
-    except Exception as e:
-        return await status_msg.edit(content=f"❌ Something went wrong while creating channels: {e}")
+            await asyncio.sleep(0.8)
+
+        try:
+            await status_msg.edit(content=f"⚙️ Setting up your server... {cat_index}/{total_categories} categories processed ({len(created)} channels ready so far).")
+        except Exception:
+            pass
 
     # --- Auto-configure every bot feature to point at what was just made ---
     server_config.setdefault(gid, {})
@@ -5417,40 +5478,71 @@ async def setup_server(ctx):
             jail_note = "⚠️ Couldn't set up the Jailed role automatically (missing Manage Roles) -- run `?setjailchannel` again once that's fixed."
 
     # Post the self-role menu (using whatever categories this guild already
-    # has configured -- built-ins the first time) into the self-roles channel.
+    # has configured -- built-ins the first time) into the self-roles channel,
+    # but only if it doesn't already have one posted (avoids spamming a
+    # duplicate menu on re-runs).
     role_note = ""
     self_role_channel = created.get("self_roles")
     if self_role_channel:
-        categories = get_guild_role_categories(guild.id)
-        non_empty = {name: roles for name, roles in categories.items() if roles}
-        if non_empty:
-            for chunk in chunk_categories(non_empty, size=5):
-                await self_role_channel.send(
-                    embed=discord.Embed(
-                        title="🎭 Choose Your Roles",
-                        description="Pick from the dropdowns below -- your selections apply instantly and privately.",
-                        color=0x5865F2
-                    ),
-                    view=DynamicRolePicker(chunk)
-                )
-            role_note = f"🎭 Self-role menu posted in {self_role_channel.mention}."
+        already_posted = False
+        try:
+            async for m in self_role_channel.history(limit=20):
+                if m.author == bot.user and m.embeds and m.embeds[0].title == "🎭 Choose Your Roles":
+                    already_posted = True
+                    break
+        except Exception:
+            pass
+        if not already_posted:
+            categories = get_guild_role_categories(guild.id)
+            non_empty = {name: roles for name, roles in categories.items() if roles}
+            if non_empty:
+                for chunk in chunk_categories(non_empty, size=5):
+                    await self_role_channel.send(
+                        embed=discord.Embed(
+                            title="🎭 Choose Your Roles",
+                            description="Pick from the dropdowns below -- your selections apply instantly and privately.",
+                            color=0x5865F2
+                        ),
+                        view=DynamicRolePicker(chunk)
+                    )
+                role_note = f"🎭 Self-role menu posted in {self_role_channel.mention}."
+        else:
+            role_note = f"🎭 Self-role menu already posted in {self_role_channel.mention}."
 
+    total_expected = sum(len(c["channels"]) for c in SERVER_SETUP_BLUEPRINT["categories"])
     summary_lines = [
-        f"✅ **Server setup complete!** Created {len(created)} channels across {len(SERVER_SETUP_BLUEPRINT['categories'])} categories.",
-        "⚙️ Auto-configured: welcome, mod-log, ghost-log, leaderboard, birthday, suggestions, eulogy, confessions, and the control channel.",
+        f"✅ **Server setup finished.** {len(created)}/{total_expected} channels ready "
+        f"({len(created) - len(skipped_existing)} newly created, {len(skipped_existing)} already existed and were reused).",
     ]
+    if not failed:
+        summary_lines.append("⚙️ Auto-configured: welcome, mod-log, ghost-log, leaderboard, birthday, suggestions, eulogy, confessions, and the control channel.")
     if jail_note:
         summary_lines.append(jail_note)
     if role_note:
         summary_lines.append(role_note)
-    summary_lines.append(
-        "\n📌 Rules/announcements/welcome are read-only for @everyone, the **Staff Only** category "
-        "is hidden from @everyone (visible to any role with Manage Server/Messages or Administrator), "
-        "and everything else is open to talk in. Adjust any of it by hand any time -- this is just a "
-        "starting layout, not locked in."
-    )
+
+    if failed:
+        fail_lines = "\n".join(f"• {label}: {reason}" for label, reason in failed[:10])
+        summary_lines.append(
+            f"\n⚠️ **{len(failed)} item(s) couldn't be created:**\n{fail_lines}\n"
+            "This is almost always Discord temporarily throttling channel creation right after a "
+            "server is made (an anti-nuke safeguard, not a bug) -- wait a minute or two and run "
+            "`?setupsvr` again; it'll skip everything that's already there and only fill in what's missing."
+        )
+    else:
+        summary_lines.append(
+            "\n📌 Rules/announcements/welcome are read-only for @everyone, the **Staff Only** category "
+            "is hidden from @everyone (visible to any role with Manage Server/Messages or Administrator), "
+            "and everything else is open to talk in. Adjust any of it by hand any time -- this is just a "
+            "starting layout, not locked in."
+        )
+
     await status_msg.edit(content="\n".join(summary_lines))
-    await send_mod_log(guild, "Server Setup Run", f"Full server layout created and configured by {ctx.author.mention} via `?setupsvr`.", ctx.author)
+    await send_mod_log(
+        guild, "Server Setup Run",
+        f"`?setupsvr` run by {ctx.author.mention} -- {len(created)}/{total_expected} channels ready, {len(failed)} failed.",
+        ctx.author
+    )
 
 # --------------------------------------------------------
 # 🤖 BOT IDENTITY COMMANDS (Admins only)
