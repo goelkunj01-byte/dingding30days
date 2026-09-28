@@ -293,9 +293,11 @@ CONFESSIONS_FILE = data_path('confessions.json')  # NEW: { guild_id: count } -- 
 DIGEST_OPTOUT_FILE = data_path('digest_optout.json')  # NEW: [user_id, ...] -- users who opted out of the weekly personalized digest DM
 VOICE_TIME_FILE = data_path('voice_time_together.json')  # NEW: { guild_id: { "id1-id2" (sorted pair): total_seconds_together } } -- for ?twin
 RATE_USAGE_FILE = data_path('rate_usage.json')  # NEW: { user_id: iso_timestamp_of_last_use } -- enforces the 1/day ?rate limit
+BEST_PFP_FILE = data_path('best_pfp_users.json')  # NEW: { user_id: {"set_by":..., "set_at":...} } -- GLOBAL (not per-server) list of users whose avatar always rates a perfect 10/10 via ?rate
 ROLE_MENU_CONFIG_FILE = data_path('role_menu_config.json')  # NEW: { guild_id: { category_name: [role_name, ...] } } -- ?setup_roles categories/options, mod-extendable via ?addnewcategory/?addnewsetup
 STORY_SESSIONS_FILE = data_path('story_sessions.json')  # NEW: { thread_id: {...} } -- active ?bnstory roleplay sessions, see the ?bnstory section below
 SCHEDULED_CONTROL_ACTIONS_FILE = data_path('scheduled_control_actions.json')  # NEW: { action_id: {...} } -- delayed/auto-revert actions from the natural-language control channel, see that section below
+DM_RELAY_FILE = data_path('dm_relay.json')  # NEW: { user_id: {"guild_id":..., "channel_id":...} } -- see ?dmbot
 
 # --- LEADERBOARD CONFIG ---
 LEADERBOARD_CHANNEL_NAME = "general" 
@@ -436,6 +438,9 @@ if voice_time_together is None:
 rate_usage = load_data(RATE_USAGE_FILE, default={})  # NEW: { user_id: iso_timestamp }
 if rate_usage is None:
     rate_usage = {}
+best_pfp_users = load_data(BEST_PFP_FILE, default={})  # NEW: { user_id: {"set_by":..., "set_at":...} } -- see ?bestpfp
+if best_pfp_users is None:
+    best_pfp_users = {}
 role_menu_config = load_data(ROLE_MENU_CONFIG_FILE, default={})  # NEW: { guild_id: { category_name: [role_name, ...] } }
 if role_menu_config is None:
     role_menu_config = {}
@@ -445,6 +450,9 @@ if story_sessions is None:
 scheduled_control_actions = load_data(SCHEDULED_CONTROL_ACTIONS_FILE, default={})  # NEW: { action_id: {...} } -- see the control-channel section
 if scheduled_control_actions is None:
     scheduled_control_actions = {}
+dm_relay_targets = load_data(DM_RELAY_FILE, default={})  # NEW: { user_id: {"guild_id":..., "channel_id":...} } -- see ?dmbot
+if dm_relay_targets is None:
+    dm_relay_targets = {}
 # In-memory only (doesn't need to survive a restart -- worst case one VC
 # session's time before a redeploy doesn't get counted, no big deal):
 # { (guild_id, channel_id): { user_id: join_datetime } }
@@ -2142,7 +2150,34 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 @bot.event
 async def on_message(message):
-    if message.author == bot.user or message.guild is None:
+    if message.author == bot.user:
+        await bot.process_commands(message)
+        return
+
+    if message.guild is None:
+        # NEW: ?dmbot relay -- if this DM author has an active relay target
+        # set and this message isn't a command, forward it into that
+        # server's channel instead of doing nothing with it. Runs before
+        # process_commands so it never swallows/duplicates an actual command.
+        if not message.content.startswith(bot.command_prefix):
+            relay = dm_relay_targets.get(str(message.author.id))
+            if relay:
+                relay_guild = bot.get_guild(relay["guild_id"])
+                relay_channel = relay_guild.get_channel(relay["channel_id"]) if relay_guild else None
+                if not relay_channel:
+                    await message.channel.send("❌ Your relay target server/channel no longer exists -- set a new one with `?dmbot <server_id> <channel_id>`.")
+                else:
+                    try:
+                        if message.content.strip():
+                            await relay_channel.send(message.content)
+                        for attachment in message.attachments:
+                            await relay_channel.send(attachment.url)
+                        if message.content.strip() or message.attachments:
+                            await message.add_reaction("📨")
+                    except discord.Forbidden:
+                        await message.channel.send(f"❌ I don't have permission to send in {relay_channel.mention} anymore -- fix that or set a new target with `?dmbot`.")
+                    except Exception as e:
+                        await message.channel.send(f"❌ Failed to relay that message: {e}")
         await bot.process_commands(message)
         return
 
@@ -5174,6 +5209,60 @@ async def on_bot(ctx, server_id: Optional[int] = None):
 
 CHATSBOT_ALLOWED_USERNAMES = {"kanjuubarfiiii"}
 
+# --------------------------------------------------------
+# 📨 ?dmbot -- DM RELAY INTO A SERVER CHANNEL
+# --------------------------------------------------------
+# Run in DM with the bot: `?dmbot <server_id> [channel_id]` picks a target,
+# then anything you DM the bot (that isn't a ?command) gets posted into that
+# channel (text + attachment links). `?dmbot off` stops it, `?dmbot` alone
+# shows the current target. You must be an Administrator in the target
+# server, so this can't be used to post into servers you don't run.
+@bot.command(name="dmbot", usage="<server_id> [channel_id] | off", help="Run in DM with the bot: picks a server/channel, then everything you DM the bot gets posted there. `?dmbot off` stops it. You must be an Administrator in that server.")
+async def dm_bot_relay(ctx, server_id: Optional[str] = None, channel_id: Optional[str] = None):
+    if ctx.guild is not None:
+        return await ctx.send("❌ Run `?dmbot` in a DM with me, not in a server.")
+
+    uid = str(ctx.author.id)
+
+    if server_id is None:
+        relay = dm_relay_targets.get(uid)
+        if not relay:
+            return await ctx.send("📭 No relay set. Use `?dmbot <server_id> [channel_id]` to pick where your DMs get posted.")
+        g = bot.get_guild(relay["guild_id"])
+        c = g.get_channel(relay["channel_id"]) if g else None
+        return await ctx.send(f"📨 Relay is ON → **{g.name if g else relay['guild_id']}** / #{c.name if c else relay['channel_id']}. Use `?dmbot off` to stop.")
+
+    if server_id.lower() in ("off", "stop", "disable"):
+        if dm_relay_targets.pop(uid, None) is None:
+            return await ctx.send("❌ You don't have a relay active.")
+        save_data(dm_relay_targets, DM_RELAY_FILE)
+        return await ctx.send("🛑 DM relay turned off. Your DMs won't be posted anywhere now.")
+
+    if not server_id.isdigit():
+        return await ctx.send("❌ Usage: `?dmbot <server_id> [channel_id]` or `?dmbot off`.")
+
+    guild = bot.get_guild(int(server_id))
+    if not guild:
+        return await ctx.send(f"❌ I'm not in a server with ID `{server_id}`.")
+    member = guild.get_member(ctx.author.id)
+    if not member or not member.guild_permissions.administrator:
+        return await ctx.send("❌ You need to be an Administrator in that server to relay messages into it.")
+
+    if channel_id:
+        if not channel_id.isdigit():
+            return await ctx.send("❌ Channel must be a channel ID (right-click the channel → Copy Channel ID).")
+        channel = guild.get_channel(int(channel_id))
+    else:
+        channel = guild.system_channel or next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
+    if not channel or not isinstance(channel, discord.TextChannel):
+        return await ctx.send("❌ Couldn't find that text channel in the server.")
+    if not channel.permissions_for(guild.me).send_messages:
+        return await ctx.send(f"❌ I can't send messages in #{channel.name}.")
+
+    dm_relay_targets[uid] = {"guild_id": guild.id, "channel_id": channel.id}
+    save_data(dm_relay_targets, DM_RELAY_FILE)
+    await ctx.send(f"📨 Relay ON → **{guild.name}** / #{channel.name}. Anything you DM me now (not starting with `?`) gets posted there. `?dmbot off` to stop.")
+
 @bot.command(name="chatsbot", usage="@user", help="[Owner only] Dumps a transcript of a user's recent ?talk conversation with the bot.")
 async def chats_bot(ctx, user: discord.User):
     if ctx.author.name.lower() not in CHATSBOT_ALLOWED_USERNAMES:
@@ -5239,77 +5328,107 @@ def format_channel_name(item: dict) -> str:
 # self-roles, etc). "public_read_only" marks a channel where @everyone can
 # view but not type (rules/announcements/welcome-style). "staff_only" on a
 # category hides the whole category from @everyone.
-SERVER_SETUP_BLUEPRINT = {
-    "categories": [
-        {
-            "name": "🔰 Entrance",
-            "channels": [
-                {"type": "text", "key": "rules", "name": "rules", "emoji": "📜", "public_read_only": True},
-                {"type": "text", "key": "announcements", "name": "announcements", "emoji": "📢", "public_read_only": True},
-                {"type": "text", "key": "welcome", "name": "welcome", "emoji": "👋", "public_read_only": True},
-                {"type": "text", "key": "self_roles", "name": "self-role", "emoji": "🎭"},
-                {"type": "text", "key": "suggestions", "name": "suggestions", "emoji": "📝"},
-            ],
-        },
-        {
-            "name": "💬 Text World",
-            "channels": [
-                {"type": "text", "key": "general", "name": "general", "emoji": "💬"},
-                {"type": "text", "key": "bot", "name": "bot", "emoji": "🤖"},
-                {"type": "text", "key": "spam", "name": "spam", "emoji": "🗑️"},
-                {"type": "text", "key": "shame", "name": "shame", "emoji": "🙈"},
-                {"type": "text", "key": "confession", "name": "confession", "emoji": "🤫"},
-                {"type": "text", "key": "eulogy", "name": "eulogy", "emoji": "🕊️"},
-            ],
-        },
-        {
-            "name": "🌸 Media",
-            "channels": [
-                {"type": "text", "key": "art", "name": "art", "emoji": "🎨"},
-                {"type": "text", "key": "pfp", "name": "pfp", "emoji": "🖼️"},
-                {"type": "text", "key": "flex", "name": "flex", "emoji": "💪"},
-                {"type": "text", "key": "foodies", "name": "foodies", "emoji": "🍔"},
-                {"type": "text", "key": "trash", "name": "trash", "emoji": "🚮"},
-                {"type": "text", "key": "media", "name": "media", "emoji": "📸"},
-            ],
-        },
-        {
-            "name": "🎲 Games",
-            "channels": [
-                {"type": "text", "key": "dank", "name": "dank", "emoji": "💵"},
-                {"type": "text", "key": "owo", "name": "owo", "emoji": "🦉"},
-                {"type": "text", "key": "bot_game", "name": "bot-game", "emoji": "🕹️"},
-            ],
-        },
-        {
-            "name": "🎵 Music World",
-            "channels": [
-                {"type": "text", "key": "music", "name": "music-1", "emoji": "🎶"},
-            ],
-        },
-        {
-            "name": "🔊 Vc World",
-            "channels": [
-                {"type": "voice", "key": "vc_general", "name": "General VC", "emoji": "🎙️"},
-                {"type": "voice", "key": "vc_samajik", "name": "Samajik Baate", "emoji": "🗣️"},
-                {"type": "voice", "key": "vc_kutto", "name": "Kutto Ka VC", "emoji": "🐶"},
-                {"type": "voice", "key": "vc_chai", "name": "Chai Ki Tapri", "emoji": "☕"},
-                {"type": "voice", "key": "vc_movie", "name": "Movie Time", "emoji": "🎬"},
-            ],
-        },
-        {
-            "name": "🛡️ Staff Only",
-            "staff_only": True,
-            "channels": [
-                {"type": "text", "key": "mod_chat", "name": "mod-chat", "emoji": "🔒"},
-                {"type": "text", "key": "mod_log", "name": "mod-log", "emoji": "📋"},
-                {"type": "text", "key": "ghost_log", "name": "ghost-log", "emoji": "👻"},
-                {"type": "text", "key": "control_room", "name": "control-room", "emoji": "🗳️"},
-                {"type": "text", "key": "jail", "name": "jail", "emoji": "🚔"},
-            ],
-        },
-    ]
+#
+# NEW: instead of one fixed set of names, each channel/category has a pool
+# of name+emoji variants, and the categories themselves get shuffled (aside
+# from Entrance staying first and Staff Only staying last, which just makes
+# sense structurally). build_server_blueprint() below picks from these pools
+# using a random.Random seeded on the guild's own ID -- so the SAME server
+# always gets the SAME layout back (re-running ?setupsvr can still tell what
+# it already made, by name), but DIFFERENT servers land on different name
+# choices, emoji, and category order, so no two servers look identical.
+CHANNEL_VARIANTS = {
+    "rules":         {"type": "text", "names": ["rules", "server-rules", "guidelines"], "emojis": ["📜", "📖", "📋"], "public_read_only": True},
+    "announcements": {"type": "text", "names": ["announcements", "news", "updates"], "emojis": ["📢", "📣", "🗞️"], "public_read_only": True},
+    "welcome":       {"type": "text", "names": ["welcome", "start-here", "greetings"], "emojis": ["👋", "🚪", "🌟"], "public_read_only": True},
+    "self_roles":    {"type": "text", "names": ["self-role", "get-roles", "pick-roles"], "emojis": ["🎭", "🎨", "🏷️"]},
+    "suggestions":   {"type": "text", "names": ["suggestions", "ideas", "feedback"], "emojis": ["📝", "💡", "🗳️"]},
+    "general":       {"type": "text", "names": ["general", "main-chat", "chit-chat", "lounge"], "emojis": ["💬", "🗨️", "🛋️"]},
+    "bot":           {"type": "text", "names": ["bot", "bot-commands", "command-center"], "emojis": ["🤖", "⚙️", "🎛️"]},
+    "spam":          {"type": "text", "names": ["spam", "spam-zone", "chaos"], "emojis": ["🗑️", "🌀", "🎉"]},
+    "shame":         {"type": "text", "names": ["shame", "hall-of-shame", "clown-corner"], "emojis": ["🙈", "🤡", "😳"]},
+    "confession":    {"type": "text", "names": ["confession", "confess", "secrets"], "emojis": ["🤫", "🕵️", "🔮"]},
+    "eulogy":        {"type": "text", "names": ["eulogy", "rip", "goodbyes"], "emojis": ["🕊️", "⚰️", "🪦"]},
+    "art":           {"type": "text", "names": ["art", "fan-art", "creations"], "emojis": ["🎨", "🖌️", "✏️"]},
+    "pfp":           {"type": "text", "names": ["pfp", "avatars", "pfp-drop"], "emojis": ["🖼️", "📸", "🪞"]},
+    "flex":          {"type": "text", "names": ["flex", "show-off", "flexing"], "emojis": ["💪", "🏆", "🔥"]},
+    "foodies":       {"type": "text", "names": ["foodies", "food-pics", "yumyum"], "emojis": ["🍔", "🍕", "🍜"]},
+    "trash":         {"type": "text", "names": ["trash", "shitpost", "junk"], "emojis": ["🚮", "🗑️", "🚽"]},
+    "media":         {"type": "text", "names": ["media", "clips", "gallery"], "emojis": ["📸", "🎞️", "🖼️"]},
+    "dank":          {"type": "text", "names": ["dank", "dank-memer", "dank-zone"], "emojis": ["💵", "🃏", "🤑"]},
+    "owo":           {"type": "text", "names": ["owo", "owo-bot", "owo-hunt"], "emojis": ["🦉", "🐾", "✨"]},
+    "bot_game":      {"type": "text", "names": ["bot-game", "mini-games", "arcade"], "emojis": ["🕹️", "🎮", "🎯"]},
+    "vc_general":    {"type": "voice", "names": ["General VC", "Main Voice", "The Lobby"], "emojis": ["🎙️", "🔊", "🎧"]},
+    "vc_samajik":    {"type": "voice", "names": ["Samajik Baate", "Adda Time", "Desi Talks"], "emojis": ["🗣️", "🫖", "💭"]},
+    "vc_kutto":      {"type": "voice", "names": ["Kutto Ka VC", "Paagalpan Zone", "Bakchodi Adda"], "emojis": ["🐶", "🐺", "🎪"]},
+    "vc_chai":       {"type": "voice", "names": ["Chai Ki Tapri", "Coffee Corner", "Break Room"], "emojis": ["☕", "🍵", "🥤"]},
+    "vc_movie":      {"type": "voice", "names": ["Movie Time", "Cinema Hall", "Screening Room"], "emojis": ["🎬", "🍿", "📽️"]},
+    "mod_chat":      {"type": "text", "names": ["mod-chat", "staff-chat", "mod-lounge"], "emojis": ["🔒", "🛠️", "🗝️"]},
+    "mod_log":       {"type": "text", "names": ["mod-log", "logs", "action-log"], "emojis": ["📋", "🧾", "📑"]},
+    "ghost_log":     {"type": "text", "names": ["ghost-log", "ghost-pings", "deleted-log"], "emojis": ["👻", "🕳️", "🚫"]},
+    "control_room":  {"type": "text", "names": ["control-room", "command-center", "hq"], "emojis": ["🗳️", "🎚️", "🧭"]},
+    "jail":          {"type": "text", "names": ["jail", "the-cell", "timeout-zone"], "emojis": ["🚔", "⛓️", "🔐"]},
 }
+
+# NEW: Music World is now 3 VOICE channels (was 1 text channel) -- picked as
+# a themed trio so they read as a matched set rather than 3 random names.
+MUSIC_VC_SETS = [
+    [("Music Room 1", "🎶"), ("Music Room 2", "🎧"), ("Music Room 3", "🎤")],
+    [("Lofi Lounge", "🎼"), ("Rock Cave", "🎸"), ("Chill Vibes", "🎻")],
+    [("Beat Drop", "🥁"), ("Piano Bar", "🎹"), ("Jazz Night", "🎺")],
+    [("Study Beats", "📚"), ("Party Mix", "🪩"), ("Acoustic Corner", "🪕")],
+]
+
+CATEGORY_DEFS = [
+    {"key": "entrance", "names": ["Entrance", "Welcome Gate", "Front Desk", "Start Here"], "emojis": ["🔰", "🚪", "🌟"],
+     "channel_keys": ["rules", "announcements", "welcome", "self_roles", "suggestions"], "pin": "first"},
+    {"key": "text_world", "names": ["Text World", "Chat Zone", "The Hub", "Main Street"], "emojis": ["💬", "🗨️", "🌐"],
+     "channel_keys": ["general", "bot", "spam", "shame", "confession", "eulogy"]},
+    {"key": "media", "names": ["Media", "Gallery", "Showcase", "Snapshots"], "emojis": ["🌸", "🖼️", "📸"],
+     "channel_keys": ["art", "pfp", "flex", "foodies", "trash", "media"]},
+    {"key": "games", "names": ["Games", "Game Zone", "Arcade", "Playground"], "emojis": ["🎲", "🎮", "🕹️"],
+     "channel_keys": ["dank", "owo", "bot_game"]},
+    {"key": "music_world", "names": ["Music World", "Sound Booth", "Jukebox", "Beat Street"], "emojis": ["🎵", "🎶", "🎧"],
+     "channel_keys": ["MUSIC"]},  # special-cased in build_server_blueprint -- pulls from MUSIC_VC_SETS
+    {"key": "vc_world", "names": ["Vc World", "Voice Lounge", "Talk Town", "Hangout Hub"], "emojis": ["🔊", "🎙️", "📞"],
+     "channel_keys": ["vc_general", "vc_samajik", "vc_kutto", "vc_chai", "vc_movie"]},
+    {"key": "staff_only", "names": ["Staff Only", "Mod Zone", "Command Center", "HQ"], "emojis": ["🛡️", "🔐", "⚔️"],
+     "channel_keys": ["mod_chat", "mod_log", "ghost_log", "control_room", "jail"], "staff_only": True, "pin": "last"},
+]
+
+def build_server_blueprint(guild: discord.Guild) -> dict:
+    """Generates this server's full category/channel layout, seeded on the
+    guild's own ID so it's deterministic per-server (stable across re-runs of
+    ?setupsvr) but varies between different servers."""
+    rng = random.Random(guild.id)
+
+    middle = [c for c in CATEGORY_DEFS if c.get("pin") not in ("first", "last")]
+    rng.shuffle(middle)
+    ordered_defs = (
+        [c for c in CATEGORY_DEFS if c.get("pin") == "first"]
+        + middle
+        + [c for c in CATEGORY_DEFS if c.get("pin") == "last"]
+    )
+
+    categories = []
+    for cat_def in ordered_defs:
+        cat_name = f'{rng.choice(cat_def["emojis"])} {rng.choice(cat_def["names"])}'
+        channels = []
+        if cat_def["channel_keys"] == ["MUSIC"]:
+            music_set = rng.choice(MUSIC_VC_SETS)
+            for i, (vc_name, vc_emoji) in enumerate(music_set, 1):
+                channels.append({"type": "voice", "key": f"music_{i}", "name": vc_name, "emoji": vc_emoji})
+        else:
+            for ck in cat_def["channel_keys"]:
+                v = CHANNEL_VARIANTS[ck]
+                channels.append({
+                    "type": v["type"], "key": ck,
+                    "name": rng.choice(v["names"]), "emoji": rng.choice(v["emojis"]),
+                    "public_read_only": v.get("public_read_only", False),
+                })
+        categories.append({"name": cat_name, "staff_only": cat_def.get("staff_only", False), "channels": channels})
+
+    return {"categories": categories}
 
 @bot.command(
     name="setupsvr", aliases=["setupserver"],
@@ -5320,6 +5439,7 @@ SERVER_SETUP_BLUEPRINT = {
 async def setup_server(ctx):
     guild = ctx.guild
     gid = str(guild.id)
+    blueprint = build_server_blueprint(guild)  # this server's own layout -- seeded on guild.id, stable across re-runs
 
     confirm_msg = await ctx.send(
         "⚠️ This will create a full set of categories and channels in this server (rules, "
@@ -5385,8 +5505,8 @@ async def setup_server(ctx):
                 return None
         return None
 
-    total_categories = len(SERVER_SETUP_BLUEPRINT["categories"])
-    for cat_index, cat_data in enumerate(SERVER_SETUP_BLUEPRINT["categories"], 1):
+    total_categories = len(blueprint["categories"])
+    for cat_index, cat_data in enumerate(blueprint["categories"], 1):
         cat_display_name = cat_data["name"]
         is_staff = cat_data.get("staff_only", False)
 
@@ -5520,7 +5640,7 @@ async def setup_server(ctx):
         else:
             role_note = f"🎭 Self-role menu already posted in {self_role_channel.mention}."
 
-    total_expected = sum(len(c["channels"]) for c in SERVER_SETUP_BLUEPRINT["categories"])
+    total_expected = sum(len(c["channels"]) for c in blueprint["categories"])
     summary_lines = [
         f"✅ **Server setup finished.** {len(created)}/{total_expected} channels ready "
         f"({len(created) - len(skipped_existing)} newly created, {len(skipped_existing)} already existed and were reused).",
@@ -5553,6 +5673,50 @@ async def setup_server(ctx):
         guild, "Server Setup Run",
         f"`?setupsvr` run by {ctx.author.mention} -- {len(created)}/{total_expected} channels ready, {len(failed)} failed.",
         ctx.author
+    )
+
+@bot.command(
+    name="welcometest",
+    help="[Mods only] Manually fires the exact welcome-message flow for you, right now, in the configured welcome channel -- lets you check the channel/permissions are set up right without waiting for a real member to join."
+)
+@commands.has_permissions(manage_guild=True)
+async def welcome_test(ctx):
+    channel = get_configured_channel(ctx.guild, "welcome_channel_id")
+    if not channel:
+        return await ctx.send("❌ No welcome channel configured for this server yet. Run `?setchannel welcome #channel` (or `?setupsvr`) first.")
+
+    embed = discord.Embed(
+        title="Welcome to the Server! 🎉",
+        description=f"Welcome {ctx.author.mention}! We're glad to have you here.",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_thumbnail(url=ctx.author.display_avatar.url)
+    embed.add_field(name="Member Count", value=f"You are our {ctx.guild.member_count}th member!", inline=False)
+    embed.set_footer(text=f"ID: {ctx.author.id}")
+
+    try:
+        await channel.send(content=f"Hey {ctx.author.mention}, welcome!", embed=embed)
+    except discord.Forbidden:
+        return await ctx.send(f"❌ Found the welcome channel ({channel.mention}) but I don't have permission to send messages there. Fix my permissions in that channel and try again.")
+    except Exception as e:
+        return await ctx.send(f"❌ Something went wrong sending the test welcome message: {e}")
+
+    # NEW: this is the #1 reason on_member_join silently never fires for real
+    # joins even though the code and welcome channel are both correct -- the
+    # "Server Members Intent" privileged intent has to be switched ON for
+    # this specific bot application in the Discord Developer Portal, in
+    # addition to `intents.members = True` already being set in the code.
+    # Discord doesn't error when it's missing -- the event just never fires.
+    await ctx.send(
+        f"✅ Test welcome message sent in {channel.mention} -- the channel and permissions are fine.\n\n"
+        f"If that looked right but **real** member joins still don't trigger a welcome message, the "
+        f"almost-certain cause is the **Server Members Intent** toggle not being enabled for this bot "
+        f"in the Discord Developer Portal: **discord.com/developers/applications** → your app → **Bot** "
+        f"tab → **Privileged Gateway Intents** → turn on **SERVER MEMBERS INTENT** → Save Changes → "
+        f"restart the bot on Railway. The code already requests this intent (`intents.members = True`), "
+        f"but Discord also requires the matching toggle on the Developer Portal side, and silently drops "
+        f"the join events if it's off instead of throwing an error -- that's why it looks like nothing's wrong."
     )
 
 # --------------------------------------------------------
@@ -5789,6 +5953,34 @@ async def build_rate_response(invoker_id: int, member) -> tuple:
             hours, remainder = divmod(int(remaining.total_seconds()), 3600)
             minutes = remainder // 60
             return None, f"⏳ You can only use `?rate`/`/rate` once per day. Try again in **{hours}h {minutes}m**."
+
+    # NEW: ?bestpfp -- if the person being rated has been flagged, skip the
+    # AI call entirely and always hand back a perfect score. Still consumes
+    # the invoker's once-a-day usage like a normal rating would, so it can't
+    # be used to dodge the daily limit.
+    if str(member.id) in best_pfp_users:
+        rate_usage[invoker_str] = datetime.now(timezone.utc).isoformat()
+        save_data(rate_usage, RATE_USAGE_FILE)
+        best_pfp_line = random.choice([
+            "Certified flawless. There is nothing left to improve here.",
+            "This is what every other profile picture wishes it looked like.",
+            "Peak performance. Unimprovable. A benchmark for the rest of us.",
+            "10/10, no notes, case closed.",
+        ])
+        embed = discord.Embed(
+            title=f"🖼️ Avatar Rating: {member.name}",
+            description=(
+                "0. **What's literally visible** -- a top-tier profile picture, plain and simple.\n"
+                "1. **Identification** -- doesn't matter, it's perfect regardless.\n"
+                "2. **Rating** -- **10/10** 🏆\n"
+                f"3. **Description** -- {best_pfp_line}\n"
+                "4. **Suggestion** -- none. Don't touch it."
+            ),
+            color=0xFFD700
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        return embed, None
+
     try:
         avatar_asset = member.display_avatar.with_size(512).with_format("png")
         avatar_bytes = await avatar_asset.read()
@@ -5827,6 +6019,26 @@ async def rate_slash(interaction: discord.Interaction, user: Optional[discord.Us
         await interaction.followup.send(error)
     else:
         await interaction.followup.send(embed=embed)
+
+@bot.command(name="bestpfp", usage="@user", help="[Mods only] Flags a user's avatar so ?rate/?rate always gives it a perfect 10/10, no matter what it actually looks like.")
+@commands.has_permissions(manage_messages=True)
+async def best_pfp(ctx, member: discord.Member):
+    if str(member.id) in best_pfp_users:
+        return await ctx.send(f"❌ {member.display_name} is already flagged for a guaranteed 10/10 on `?rate`.")
+    best_pfp_users[str(member.id)] = {"set_by": ctx.author.id, "set_at": datetime.now(timezone.utc).isoformat()}
+    save_data(best_pfp_users, BEST_PFP_FILE)
+    await ctx.send(f"🏆 {member.mention}'s avatar will now always score a perfect **10/10** on `?rate`, everywhere this bot is added, until a mod removes it with `?removebestpfp @user`.")
+    await send_mod_log(ctx.guild, "Best PFP Flag Set", f"**User:** {member.mention}", ctx.author)
+
+@bot.command(name="removebestpfp", usage="@user", help="[Mods only] Removes the guaranteed-10/10 flag from a user, so ?rate goes back to actually rating their avatar.")
+@commands.has_permissions(manage_messages=True)
+async def remove_best_pfp(ctx, member: discord.Member):
+    if str(member.id) not in best_pfp_users:
+        return await ctx.send(f"❌ {member.display_name} doesn't have the guaranteed-10/10 flag set.")
+    best_pfp_users.pop(str(member.id), None)
+    save_data(best_pfp_users, BEST_PFP_FILE)
+    await ctx.send(f"✅ Removed {member.mention}'s guaranteed-10/10 flag. `?rate` will actually rate their avatar again.")
+    await send_mod_log(ctx.guild, "Best PFP Flag Removed", f"**User:** {member.mention}", ctx.author)
 
 @bot.command(help="AI reads the recent chat and gives a fun read on the server's current vibe/energy.")
 async def vibecheck(ctx):
@@ -7838,6 +8050,7 @@ class HelpView(ui.View):
         embed.add_field(name="`?stopspamem @user`", value="Stops the emoji auto-react for a user.", inline=False)
         embed.add_field(name="`?addav @user` (attach an image)", value="Sets a custom avatar override -- their `?av` shows this image everywhere this bot is, until removed.", inline=False)
         embed.add_field(name="`?removeav @user`", value="Removes a user's custom avatar override.", inline=False)
+        embed.add_field(name="`?bestpfp @user` / `?removebestpfp @user`", value="Flags a user so `?rate` on their avatar always gives a perfect 10/10 (or removes the flag).", inline=False)
         embed.add_field(name="`?jail @user [reason]`", value="Jails a member -- they can only see/type in the configured jail channel until `?unjail`. Needs `?setjailchannel` set up first (see the Server Setup page).", inline=False)
         embed.add_field(name="`?unjail @user`", value="Releases a jailed member.", inline=False)
         embed.add_field(name="`?undo`", value="Reverses the last undoable moderation action on this server -- purge, warn, timeout, ban, kick, jail, lock/unlock, or `?resetlb`. Works for both `?commands` and the control channel.", inline=False)
@@ -7870,6 +8083,8 @@ class HelpView(ui.View):
         embed.add_field(name="`?steal <emoji>`", value="Clone an emoji from another server into this one.", inline=False)
         embed.add_field(name="`?schedule <movie> <MM/DD/YYYY> <HH:MM>`", value="Schedule a movie/event announcement.", inline=False)
         embed.add_field(name="`?resizepfp` (attach an image)", value="Fits an attached image into Discord's square avatar shape with no cropping and no stretching -- fills the leftover space with a blurred version of the same image instead of a blank background. Works in DM too.", inline=False)
+        embed.add_field(name="`?dmbot <server_id> [channel_id]` / `?dmbot off`", value="Run in DM with the bot (server Administrators only): everything you DM the bot afterward gets posted into that server's channel.", inline=False)
+        embed.add_field(name="`?welcometest`", value="[Mods only] Fires a test welcome message in the configured welcome channel.", inline=False)
         return embed
 
     def get_ai_page(self, embed):
