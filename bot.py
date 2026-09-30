@@ -63,22 +63,28 @@ SAFETY_SETTINGS = [
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 GROQ_TEXT_MODEL = "openai/gpt-oss-120b"  # used by everything except ?talk/?bnstory: ?vibecheck, ?roast, riddles, ?rate fallback text, etc.
-# UPDATED (fix for Groq's 08/16/26 shutdown of llama-3.3-70b-versatile, take
-# 2): ?talk/?bnstory were pinned to llama-3.3-70b-versatile for its
-# personality/flirty-roleplay tone. moonshotai/kimi-k2-instruct-0905 was
-# tried as a replacement, but Groq deprecated it back on 03/23/26 in favor of
-# openai/gpt-oss-120b -- it 404s with model_not_found on current accounts.
-# As of 06/17/26 Groq also retired llama-3.1-8b-instant, qwen/qwen3-32b, and
-# meta-llama/llama-4-scout, funneling almost everything into openai/gpt-oss-
-# 120b/20b. Of what's actually still live on Groq, qwen/qwen3.6-27b (same
-# model GROQ_VISION_MODEL already uses) is the closest fit -- a real
-# general-purpose chat model, and noticeably less locked-down for flirty/
-# romantic roleplay than OpenAI's gpt-oss models. It IS a reasoning model, so
-# it needs reasoning_effort suppressed like the others below (but NOT
-# combined with reasoning_format, which is the specific combo that 400s --
-# see the GROQ_VISION_REASONING_KWARGS note just below).
-GROQ_CHAT_MODEL = "qwen/qwen3.6-27b"
-GROQ_VISION_MODEL = "qwen/qwen3.6-27b"  # Groq marks this a preview model -- could change/move without much notice, but it's the only vision option Groq currently offers
+# UPDATED (fix for Groq's 09/14/26 shutdown of qwen/qwen3.6-27b): ?talk and
+# ?bnstory were pinned to qwen/qwen3.6-27b for its personality/flirty-
+# roleplay tone (chosen after llama-3.3-70b-versatile and then
+# moonshotai/kimi-k2-instruct-0905 were ALSO deprecated out from under this
+# same chat feature -- see the git history/older comments here for that
+# saga). qwen/qwen3.6-27b is now dead too -- Groq's own deprecation notice
+# points at qwen/qwen3.8-27b as the direct successor, but that's another
+# rotating Preview-tier point release, which is exactly the pattern that's
+# already killed this constant twice. Switching to openai/gpt-oss-120b
+# instead -- Groq's own repeated recommended replacement, and a GA
+# production model rather than a Preview-tier one that can vanish again with
+# little notice. Yes, it's slightly more conservative/less "unfiltered" than
+# qwen was for flirty roleplay, but a chat command that actually works beats
+# one that's stylistically nicer and silently 404s.
+GROQ_CHAT_MODEL = "openai/gpt-oss-120b"
+# NEW: vision is kept on the Qwen line since gpt-oss models are text-only
+# (no image input) -- qwen/qwen3.8-27b is Groq's documented successor to the
+# now-dead qwen/qwen3.6-27b for multimodal use. Currently unused by any live
+# command (get_groq_vision_text is defined for future use -- ?rate uses
+# Gemini's vision, not this), so breakage here wouldn't show up as a bug
+# report the way the chat model's did, but keeping the ID current anyway.
+GROQ_VISION_MODEL = "qwen/qwen3.8-27b"  # Groq marks this a preview model -- could change/move without much notice, same trap that killed qwen3.6-27b
 
 # BUG FIX: both GROQ_TEXT_MODEL and GROQ_VISION_MODEL are "reasoning" models
 # (thinking mode). Without telling the API to suppress that, their internal
@@ -90,21 +96,16 @@ GROQ_VISION_MODEL = "qwen/qwen3.6-27b"  # Groq marks this a preview model -- cou
 # return the final answer.
 GROQ_TEXT_REASONING_KWARGS = {"include_reasoning": False, "reasoning_effort": "low"}
 GROQ_VISION_REASONING_KWARGS = {"reasoning_effort": "none", "reasoning_format": "hidden"}  # BUG FIX: include_reasoning + reasoning_format together = 400 invalid_request_error, Groq rejects the combo
-# NEW: qwen3.6-27b for chat -- deliberately just reasoning_effort, no
-# include_reasoning/reasoning_format, to steer clear of the same 400 error
-# noted above for the vision kwargs. IMPORTANT: unlike gpt-oss models,
-# qwen3.6-27b only accepts reasoning_effort of "none" or "default" -- "low"
-# 400s on it ({"message": "`reasoning_effort` must be one of `none` or
-# `default`"}).
-GROQ_CHAT_REASONING_KWARGS = {"reasoning_effort": "none"}
-# BUG FIX: qwen/qwen3.6-27b's default max output length (~2048 tokens) blows
-# straight through the free/on-demand tier's Output Tokens Per Minute (OTPM)
-# limit of 1000 in a SINGLE request -- Groq rejects it outright with a 429
-# ("Request too large... Requested 2048... Limit 1000"), so ?talk and
-# ?bnstory failed on literally every message. Capping max_tokens well under
-# that limit fixes it. Applies to every call using GROQ_CHAT_MODEL or
-# GROQ_VISION_MODEL, since they're currently the same model and share the
-# same per-organization OTPM quota.
+# UPDATED: now that GROQ_CHAT_MODEL is openai/gpt-oss-120b (same family as
+# GROQ_TEXT_MODEL), it uses the same reasoning kwargs as GROQ_TEXT_REASONING_KWARGS
+# instead of the qwen-specific "reasoning_effort must be none or default" quirk.
+GROQ_CHAT_REASONING_KWARGS = {"include_reasoning": False, "reasoning_effort": "low"}
+# BUG FIX: kept conservative regardless of which model is pinned here --
+# Groq's free/on-demand tier Output Tokens Per Minute (OTPM) limit has bitten
+# this constant before (a previous model's default ~2048 token output blew
+# straight through a 1000 OTPM limit in a single request), so every call
+# using GROQ_CHAT_MODEL or GROQ_VISION_MODEL caps its output well under that,
+# whichever model ends up assigned to either constant.
 GROQ_QWEN_MAX_TOKENS = 600
 
 # Create the client and start a chat session
@@ -5913,7 +5914,17 @@ async def talk(ctx, *, query):
     if ctx.guild and not is_talk_allowed_in_channel(ctx.guild, ctx.channel.id):
         return await ctx.send("❌ `?talk` isn't allowed in this channel. Check `?listtalkchannels` for where it's permitted.")
     async with ctx.typing():
-        response = await asyncio.to_thread(get_groq_chat_response, ctx.author.id, query)
+        try:
+            response = await asyncio.to_thread(get_groq_chat_response, ctx.author.id, query)
+        except Exception as e:
+            # BUG FIX: this used to propagate up to the generic command-error
+            # handler, which replies with a vague message that auto-deletes
+            # after 15s -- so a dead/renamed Groq model (this has happened
+            # more than once) looked like ?talk just doing nothing, with no
+            # useful signal for debugging. Surfacing the real error here
+            # (and NOT auto-deleting it) makes that immediately obvious.
+            print(f"🚨 ?talk Groq call failed: {e}")
+            return await ctx.send(f"❌ `?talk` couldn't reach the AI right now: `{e}`\nIf this mentions `model_not_found` or a 404, the model ID in `GROQ_CHAT_MODEL` needs updating -- Groq retires model IDs with little notice.")
         sent_messages = await safe_send(ctx.channel, response, reply_to=ctx.message)
         for m in sent_messages:
             track_talk_message(m.id, ctx.author.id)
@@ -6936,9 +6947,13 @@ WWY_VOTE_SECONDS = 60
 def get_wwy_candidate_pool(guild: discord.Guild) -> list[discord.Member]:
     # BUG FIX: only ever pull from THIS guild's own member list (guild.members
     # is always scoped to that specific Guild object -- it can't contain
-    # another server's members). If the pool ever looked wrong before, the
-    # most likely cause was an incomplete member cache on a large server; the
-    # ?whowouldyou command below forces a fresh guild.chunk() first to avoid that.
+    # another server's members). If the pool includes people who've actually
+    # left, the underlying cause is almost always that this bot's **Server
+    # Members Intent** isn't enabled in the Discord Developer Portal -- that
+    # intent is what keeps discord.py's member cache accurate on leaves
+    # (on_member_remove doesn't fire without it, so stale entries never get
+    # cleared out). run_whowouldyou_round below verifies picks live against
+    # Discord's API as a safety net regardless, but the real fix is the intent.
     return [m for m in guild.members if not m.bot]
 
 class WhoWouldYouNextView(ui.View):
@@ -6979,7 +6994,38 @@ async def run_whowouldyou_round(channel: discord.abc.Messageable, guild: discord
         await channel.send("📭 Not enough members here to play this yet.")
         return
 
-    user_a, user_b = random.sample(members_pool, 2)
+    # NEW: verify both picks against Discord's live API before locking them
+    # in -- guild.members can hold stale entries for people who've already
+    # left (see the comment on get_wwy_candidate_pool for why). fetch_member
+    # is a direct, real-time lookup that doesn't depend on that cache, so
+    # this catches it even when the cache itself is out of date.
+    user_a = user_b = None
+    pool = list(members_pool)
+    attempts = 0
+    while len(pool) >= 2 and attempts < 8 and (user_a is None or user_b is None):
+        attempts += 1
+        candidate_a, candidate_b = random.sample(pool, 2)
+        try:
+            await guild.fetch_member(candidate_a.id)
+        except (discord.NotFound, discord.HTTPException):
+            pool = [m for m in pool if m.id != candidate_a.id]
+            continue
+        try:
+            await guild.fetch_member(candidate_b.id)
+        except (discord.NotFound, discord.HTTPException):
+            pool = [m for m in pool if m.id != candidate_b.id]
+            continue
+        user_a, user_b = candidate_a, candidate_b
+
+    if user_a is None or user_b is None:
+        await channel.send(
+            "📭 Couldn't find two members who are still actually in the server after a few tries -- "
+            "this server's member list looks out of date. If this keeps happening, check that "
+            "**Server Members Intent** is enabled for this bot in the Discord Developer Portal "
+            "(Bot tab → Privileged Gateway Intents) -- that's what keeps the member list accurate."
+        )
+        return
+
     embed = discord.Embed(
         title="🆚 Who Would You Choose?",
         description=f"🅰️ {user_a.mention}\n\n**VS**\n\n🅱️ {user_b.mention}",
