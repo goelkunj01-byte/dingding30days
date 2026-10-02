@@ -299,6 +299,7 @@ ROLE_MENU_CONFIG_FILE = data_path('role_menu_config.json')  # NEW: { guild_id: {
 STORY_SESSIONS_FILE = data_path('story_sessions.json')  # NEW: { thread_id: {...} } -- active ?bnstory roleplay sessions, see the ?bnstory section below
 SCHEDULED_CONTROL_ACTIONS_FILE = data_path('scheduled_control_actions.json')  # NEW: { action_id: {...} } -- delayed/auto-revert actions from the natural-language control channel, see that section below
 DM_RELAY_FILE = data_path('dm_relay.json')  # NEW: { user_id: {"guild_id":..., "channel_id":...} } -- see ?dmbot
+VC_TIME_FILE = data_path('vc_total_time.json')  # NEW: { guild_id: { user_id: total_seconds_this_week } } -- for ?vcmvp, parallel to MESSAGES_FILE
 
 # --- LEADERBOARD CONFIG ---
 LEADERBOARD_CHANNEL_NAME = "general" 
@@ -314,6 +315,12 @@ GIPHY_API_KEY = os.getenv("GIPHY_API_KEY")
 STATUS_COMMAND_OWNERS = {"kanjuubarfiiii", "huh.ashh"}
 
 KALA_MAJDUR_IMAGE_PATH = "kala_majdur.jpg"
+
+# NEW: whenever this role is mentioned (@role-ping), the bot replies with a
+# video file. Sent as a real Discord attachment (not a link) specifically so
+# it plays inline/automatically in the client instead of needing a click.
+ROLE_MENTION_VIDEO_ROLE_ID = 1555654996295426108
+ROLE_MENTION_VIDEO_PATH = "role_mention_video.mp4"
 
 # NEW: emoji list used by ?poll to react with number emojis.
 NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -454,10 +461,20 @@ if scheduled_control_actions is None:
 dm_relay_targets = load_data(DM_RELAY_FILE, default={})  # NEW: { user_id: {"guild_id":..., "channel_id":...} } -- see ?dmbot
 if dm_relay_targets is None:
     dm_relay_targets = {}
+vc_total_time = load_data(VC_TIME_FILE, default={})  # NEW: { guild_id: { user_id: seconds } } -- see ?vcmvp
+if vc_total_time is None:
+    vc_total_time = {}
 # In-memory only (doesn't need to survive a restart -- worst case one VC
 # session's time before a redeploy doesn't get counted, no big deal):
 # { (guild_id, channel_id): { user_id: join_datetime } }
 active_voice_sessions = {}
+# NEW: lightweight in-memory game/lookup state -- lost on restart like the
+# other active_* dicts in this bot (active_impersonations, etc), which is an
+# acceptable tradeoff for stuff like "what was the last deleted message".
+last_deleted_message = {}   # channel_id -> {content, author_id, author_name, author_avatar, attachments, deleted_at}
+last_edited_message = {}    # channel_id -> {before, after, author_id, author_name, author_avatar, edited_at}
+active_wordchains = {}      # channel_id -> {"last_word": str, "length": int, "used_words": set}
+active_whodunits = {}       # channel_id -> {"murderer_id": int, "suspects": set[int], "guessed_correctly": set[int], "resolved": bool}
 
 # --- LOGGING UTILITIES ---
 
@@ -1400,6 +1417,85 @@ async def weekly_leaderboard_announcement():
 async def weekly_leaderboard_announcement_error(error):
     print(f"🚨 Weekly Leaderboard Task Error: {error}")
 
+VC_WINNER_ROLE_NAME = "🎧 VC MVP"
+
+@tasks.loop(time=time(hour=0, minute=0, tzinfo=IST_TIMEZONE))
+async def weekly_vc_leaderboard_announcement():
+    """Mirrors weekly_leaderboard_announcement above, but for voice-chat time
+    (vc_total_time) instead of message counts -- same reset schedule (Sunday
+    midnight IST), its own role, its own channel lookup, independent of the
+    text leaderboard so one failing doesn't affect the other."""
+    now_ist = datetime.now(IST_TIMEZONE)
+    if now_ist.weekday() != 6:
+        return
+
+    global vc_total_time
+    for guild_id_str, counts in vc_total_time.items():
+        if guild_id_str in disabled_servers:
+            continue
+        guild = bot.get_guild(int(guild_id_str))
+        if not guild:
+            continue
+
+        channel = get_configured_channel(guild, "leaderboard_channel_id", LEADERBOARD_CHANNEL_ID, LEADERBOARD_CHANNEL_NAME)
+        if not channel:
+            continue
+
+        user_counts = {k: v for k, v in counts.items() if guild.get_member(int(k)) and not guild.get_member(int(k)).bot}
+        if not user_counts:
+            vc_total_time[guild_id_str] = {}
+            continue
+
+        winner_id_str, max_seconds = max(user_counts.items(), key=lambda item: item[1])
+        winner = guild.get_member(int(winner_id_str))
+        if not winner or max_seconds <= 0:
+            vc_total_time[guild_id_str] = {}
+            continue
+
+        winner_role = discord.utils.get(guild.roles, name=VC_WINNER_ROLE_NAME)
+        if not winner_role:
+            try:
+                winner_role = await guild.create_role(name=VC_WINNER_ROLE_NAME, color=discord.Color.teal(), reason="Weekly VC Leaderboard Role")
+            except discord.Forbidden:
+                vc_total_time[guild_id_str] = {}
+                continue
+
+        for member in guild.members:
+            if winner_role in member.roles and member.id != winner.id:
+                try:
+                    await member.remove_roles(winner_role, reason="Previous VC MVP cleanup.")
+                except discord.Forbidden:
+                    pass
+
+        try:
+            await winner.add_roles(winner_role, reason="Weekly VC Champion: Most voice-chat time.")
+            bot.loop.create_task(
+                remove_winner_role_after_delay(guild.id, winner.id, winner_role.id, 60 * 60 * 24 * 7, channel.id)
+            )
+        except discord.Forbidden:
+            vc_total_time[guild_id_str] = {}
+            continue
+
+        hours = round(max_seconds / 3600, 1)
+        embed = discord.Embed(
+            title="🎧 WEEKLY VOICE CHAT MVP! 🎧",
+            description="This week's most dedicated voice chatter is...",
+            color=discord.Color.teal()
+        )
+        embed.add_field(name=f"🥇 The Winner: {winner.display_name} 🥇", value=f"They spent a massive **{hours}** hours in voice this week!", inline=False)
+        embed.add_field(name="👑 Reward:", value=f"They have won the temporary role: **{VC_WINNER_ROLE_NAME}**!", inline=False)
+        embed.set_thumbnail(url=winner.display_avatar.url)
+        embed.set_footer(text="Role expires in 7 days. VC time resets for the next week!")
+        await channel.send(embed=embed)
+
+        vc_total_time[guild_id_str] = {}
+
+    save_data(vc_total_time, VC_TIME_FILE)
+
+@weekly_vc_leaderboard_announcement.error
+async def weekly_vc_leaderboard_announcement_error(error):
+    print(f"🚨 Weekly VC Leaderboard Task Error: {error}")
+
 async def send_weekly_digest_dm(member: discord.Member, guild: discord.Guild, msg_count: int, rank: Optional[int], total_active: int):
     """Builds and DMs one member their personalized weekly recap. Silently
     gives up if their DMs are closed -- nothing else needs to know."""
@@ -1766,6 +1862,9 @@ async def on_ready():
     if not weekly_leaderboard_announcement.is_running():
         weekly_leaderboard_announcement.start()
 
+    if not weekly_vc_leaderboard_announcement.is_running():
+        weekly_vc_leaderboard_announcement.start()
+
     if not birthday_check_loop.is_running():
         birthday_check_loop.start()
 
@@ -1833,6 +1932,17 @@ def record_voice_overlap(guild_id: int, channel_id: int, leaving_user_id: int, n
     if changed:
         save_data(voice_time_together, VOICE_TIME_FILE)
 
+def add_own_vc_time(guild_id: int, user_id: int, seconds: float):
+    """Credits a user's own total VC time this week (used by ?vcmvp), as
+    opposed to record_voice_overlap above which tracks PAIRWISE time between
+    two people (used by ?twin) -- separate counters, same underlying events."""
+    if seconds <= 0:
+        return
+    gid_str, uid_str = str(guild_id), str(user_id)
+    vc_total_time.setdefault(gid_str, {})
+    vc_total_time[gid_str][uid_str] = vc_total_time[gid_str].get(uid_str, 0) + seconds
+    save_data(vc_total_time, VC_TIME_FILE)
+
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot:
@@ -1843,7 +1953,9 @@ async def on_voice_state_update(member, before, after):
         if before.channel is not None:
             key = (member.guild.id, before.channel.id)
             if key in active_voice_sessions and member.id in active_voice_sessions[key]:
+                my_join = active_voice_sessions[key][member.id]
                 record_voice_overlap(member.guild.id, before.channel.id, member.id, now)
+                add_own_vc_time(member.guild.id, member.id, (now - my_join).total_seconds())
                 del active_voice_sessions[key][member.id]
                 if not active_voice_sessions[key]:
                     del active_voice_sessions[key]
@@ -2017,6 +2129,21 @@ async def on_message_delete(message):
 
     now = datetime.now(timezone.utc)
 
+    # NEW: ?snipe support -- remembers the most recently deleted message per
+    # channel (in-memory only, lost on restart, same tradeoff as the other
+    # lightweight in-memory game states in this bot). Stored regardless of
+    # whether it turns out to be a ghost ping or a mod-log-worthy delete --
+    # this is just a simple "what did I just miss" lookup.
+    if message.content.strip() or message.attachments:
+        last_deleted_message[message.channel.id] = {
+            "content": message.content,
+            "author_id": message.author.id,
+            "author_name": message.author.display_name,
+            "author_avatar": message.author.display_avatar.url,
+            "attachments": [a.url for a in message.attachments],
+            "deleted_at": now.isoformat(),
+        }
+
     # NEW: logs messages a MODERATOR deleted (via Discord's audit log) to the
     # mod-log channel. Deliberately only fires when the audit log confirms a
     # mod did it -- Discord doesn't create an audit entry when someone deletes
@@ -2081,9 +2208,24 @@ async def on_message_delete(message):
 
 @bot.event
 async def on_message_edit(before, after):
-    if before.mentions and not after.mentions:
-        if before.author.bot or before.guild is None: return
+    if before.author.bot or before.guild is None:
+        return
 
+    # NEW: ?editsnipe support -- remembers the most recent edit per channel,
+    # same in-memory/lost-on-restart tradeoff as ?snipe above. Only stores
+    # when the text actually changed (an embed-load edit or similar with
+    # identical content isn't useful to show someone).
+    if before.content.strip() and before.content != after.content:
+        last_edited_message[before.channel.id] = {
+            "before": before.content,
+            "after": after.content,
+            "author_id": before.author.id,
+            "author_name": before.author.display_name,
+            "author_avatar": before.author.display_avatar.url,
+            "edited_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    if before.mentions and not after.mentions:
         # UPDATED: per-server configurable, see on_message_delete above.
         log_channel = get_configured_channel(before.guild, "ghost_log_channel_id")
         if log_channel:
@@ -2265,6 +2407,28 @@ async def on_message(message):
                     except:
                         pass
 
+    # NEW: ?wordchain live checking -- if this channel has an active round,
+    # every non-command message gets checked against the expected next word.
+    # Intentionally lightweight (just a ✅/❌ reaction, no deletes/warnings)
+    # since this runs on every message in the channel while active.
+    wc_game = active_wordchains.get(message.channel.id)
+    if wc_game and not content.startswith(bot.command_prefix) and content.strip():
+        chain_words = re.findall(r"[A-Za-z']+", content.lower())
+        if chain_words:
+            if chain_words[0] == wc_game["last_word"]:
+                wc_game["last_word"] = chain_words[-1]
+                wc_game["length"] += 1
+                wc_game["used_words"].add(chain_words[-1])
+                try:
+                    await message.add_reaction("✅")
+                except Exception:
+                    pass
+            else:
+                try:
+                    await message.add_reaction("❌")
+                except Exception:
+                    pass
+
     if "poem-" in message.channel.name.lower() and len(content.split()) > 5:
         res = await asyncio.to_thread(
             get_groq_text, f"Rate this poem from 1-5 and give a short reason:\n{content}"
@@ -2409,6 +2573,19 @@ async def on_message(message):
             print(f"⚠️ {KALA_MAJDUR_IMAGE_PATH} not found -- upload it to the same folder as bot.py.")
         except Exception as e:
             print(f"⚠️ Failed to send kala majdur image: {e}")
+
+    # NEW: role-mention video trigger -- fires whenever that specific role
+    # gets @-pinged anywhere in the server. Sent as a real file attachment
+    # (not a link/embed) so Discord clients play it inline automatically.
+    if any(r.id == ROLE_MENTION_VIDEO_ROLE_ID for r in message.role_mentions):
+        try:
+            await message.channel.send(file=discord.File(ROLE_MENTION_VIDEO_PATH))
+        except FileNotFoundError:
+            print(f"⚠️ {ROLE_MENTION_VIDEO_PATH} not found -- upload it to the same folder as bot.py.")
+        except discord.HTTPException as e:
+            print(f"⚠️ Failed to send role-mention video (too large for this server's upload limit?): {e}")
+        except Exception as e:
+            print(f"⚠️ Failed to send role-mention video: {e}")
 
     guild_triggers = triggers.get(str(message.guild.id), {})
     for phrase, trigger_data in guild_triggers.items():
@@ -8030,6 +8207,221 @@ async def resize_pfp(ctx):
         file=file
     )
 
+# --------------------------------------------------------
+# 🔍 SNIPE / EDITSNIPE
+# --------------------------------------------------------
+@bot.command(name="snipe", help="Shows the most recently deleted message in this channel.")
+async def snipe(ctx):
+    data = last_deleted_message.get(ctx.channel.id)
+    if not data:
+        return await ctx.send("📭 Nothing to snipe -- no deleted messages remembered in this channel since I last restarted.")
+    embed = discord.Embed(
+        description=data["content"] or "*(no text, attachment only)*",
+        color=discord.Color.red(),
+        timestamp=datetime.fromisoformat(data["deleted_at"])
+    )
+    embed.set_author(name=data["author_name"], icon_url=data["author_avatar"])
+    if data["attachments"]:
+        embed.add_field(name="Attachments", value="\n".join(data["attachments"][:5]), inline=False)
+        if data["attachments"][0].lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            embed.set_image(url=data["attachments"][0])
+    embed.set_footer(text="Deleted")
+    await ctx.send(embed=embed)
+
+@bot.command(name="editsnipe", aliases=["esnipe"], help="Shows the most recently edited message in this channel (before → after).")
+async def editsnipe(ctx):
+    data = last_edited_message.get(ctx.channel.id)
+    if not data:
+        return await ctx.send("📭 Nothing to editsnipe -- no edited messages remembered in this channel since I last restarted.")
+    embed = discord.Embed(color=discord.Color.orange(), timestamp=datetime.fromisoformat(data["edited_at"]))
+    embed.set_author(name=data["author_name"], icon_url=data["author_avatar"])
+    embed.add_field(name="Before", value=truncate_text(data["before"], 1000), inline=False)
+    embed.add_field(name="After", value=truncate_text(data["after"], 1000), inline=False)
+    embed.set_footer(text="Edited")
+    await ctx.send(embed=embed)
+
+# --------------------------------------------------------
+# 📜 FIRST MESSAGE
+# --------------------------------------------------------
+FIRST_MESSAGE_SCAN_LIMIT = 5000  # how deep into this channel's history to look before giving up
+
+@bot.command(name="firstmessage", aliases=["fm"], usage="[@user]", help="Jumps to the first message sent in THIS channel (or the first message a specific user sent here).")
+async def first_message(ctx, member: discord.Member = None):
+    async with ctx.typing():
+        found = None
+        scanned = 0
+        async for m in ctx.channel.history(limit=FIRST_MESSAGE_SCAN_LIMIT, oldest_first=True):
+            scanned += 1
+            if member is None or m.author.id == member.id:
+                found = m
+                break
+        if not found:
+            who = f"{member.display_name} hasn't" if member else "Nobody's"
+            return await ctx.send(f"📭 {who} posted in this channel within the first {scanned} messages I scanned -- either it's further back than that, or it just hasn't happened yet.")
+        embed = discord.Embed(
+            title="📜 First Message" + (f" by {member.display_name}" if member else " in This Channel"),
+            description=found.content or "*(no text content)*",
+            color=discord.Color.blue(),
+            timestamp=found.created_at
+        )
+        embed.set_author(name=found.author.display_name, icon_url=found.author.display_avatar.url)
+        embed.add_field(name="Jump to Message", value=f"[Click Here]({found.jump_url})", inline=False)
+        await ctx.send(embed=embed)
+
+# --------------------------------------------------------
+# 🎧 VC LEADERBOARD
+# --------------------------------------------------------
+@bot.command(name="vcmvp", aliases=["vclb", "vcleaderboard"], help="Shows the current top 10 voice-chat time rankings for the week. Resets Sunday midnight IST, same as ?leaderboard.")
+async def vc_leaderboard(ctx):
+    gid = str(ctx.guild.id)
+    counts = vc_total_time.get(gid, {})
+    if not counts:
+        return await ctx.send("No voice chat time has been tracked yet this week! Hop in a VC!")
+
+    sorted_list = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    lines = ""
+    trophies = {0: "🥇", 1: "🥈", 2: "🥉"}
+    for index, (uid, seconds) in enumerate(sorted_list[:10]):
+        member = ctx.guild.get_member(int(uid))
+        if member is None or member.bot:
+            continue
+        total_minutes = round(seconds / 60)
+        hours, minutes = divmod(total_minutes, 60)
+        time_str = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+        rank_display = trophies.get(index, f"#{index + 1}")
+        lines += f"{rank_display} **{member.display_name}**: `{time_str}`\n"
+
+    embed = discord.Embed(
+        title="🎧 Weekly Voice Chat Leaderboard 🏆",
+        description="Top voice chatters this week! Resets every Sunday at 12:00 AM IST.",
+        color=discord.Color.teal()
+    )
+    embed.add_field(name="Current Top 10", value=lines or "No valid users to display yet!", inline=False)
+    await ctx.send(embed=embed)
+
+# --------------------------------------------------------
+# 😈 CURSE
+# --------------------------------------------------------
+CURSE_ROLE_NAMES = ["🤡 Cursed", "💀 Marked", "🐸 Frog Curse", "🧟 Zombified", "👺 Goblin Mode", "🥴 Cursed Soul", "🕳️ Hexed"]
+
+@bot.command(name="curse", usage="@user [hours]", help="[Mods only] Instantly slaps a random cursed temp role on someone for laughs. Default 3 hours, max 1 week.")
+@commands.has_permissions(manage_roles=True)
+async def curse_user(ctx, member: discord.Member, hours: float = 3.0):
+    if member.bot:
+        return await ctx.send("❌ Can't curse a bot.")
+    hours = max(0.1, min(hours, 168))
+    role_name = random.choice(CURSE_ROLE_NAMES)
+    role = await assign_temp_role(ctx.guild, member, role_name, int(hours * 3600), color=discord.Color.dark_purple(), reason=f"Cursed by {ctx.author}")
+    if role:
+        await ctx.send(f"😈 {member.mention} has been cursed with **{role_name}** for {hours:g} hour(s)!")
+        await send_mod_log(ctx.guild, "User Cursed", f"**User:** {member.mention}\n**Role:** {role_name}\n**Duration:** {hours:g}h", ctx.author)
+    else:
+        await ctx.send("❌ Couldn't curse them -- check my **Manage Roles** permission and role position.")
+
+# --------------------------------------------------------
+# 🔍 WHODUNIT -- AI MURDER MYSTERY
+# --------------------------------------------------------
+@bot.command(name="whodunit", help="AI writes a murder-mystery starring 4-5 random members -- read the clues, then vote with ?guesswhodunit @user.")
+async def whodunit(ctx):
+    if ctx.channel.id in active_whodunits and not active_whodunits[ctx.channel.id].get("resolved"):
+        return await ctx.send("❌ There's already an unsolved whodunit in this channel. Finish it with `?revealwhodunit` first.")
+
+    members_pool = [m for m in ctx.guild.members if not m.bot]
+    if len(members_pool) < 4:
+        return await ctx.send("📭 Need at least 4 members here for a proper whodunit.")
+
+    suspects = random.sample(members_pool, min(5, len(members_pool)))
+    murderer = random.choice(suspects)
+    suspect_names = [m.display_name for m in suspects]
+
+    prompt = (
+        f"Write a short, fun 'whodunit' murder mystery set at a small gathering. The suspects are these "
+        f"real people (by name): {', '.join(suspect_names)}. Secretly, {murderer.display_name} is the "
+        f"culprit -- weave in subtle, fair clues pointing toward them without saying it outright. Include: "
+        f"1) a 2-3 sentence scene-setting intro (who died, where, roughly how -- keep it cartoonish, not "
+        f"graphic), 2) one short suspicious detail/alibi line for EACH suspect, clearly labeled with their "
+        f"name, keeping {murderer.display_name}'s line slightly more suspicious/contradictory than the "
+        f"others without being an obvious giveaway. Keep the whole thing under 200 words, playful tone."
+    )
+    async with ctx.typing():
+        try:
+            story = await asyncio.to_thread(get_groq_text, prompt)
+        except Exception as e:
+            print(f"🚨 Whodunit generation failed: {e}")
+            return await ctx.send("❌ Couldn't write the mystery right now, try again in a bit.")
+
+    embed = discord.Embed(title="🔍 Whodunit?", description=truncate_text(story.strip(), 1800), color=discord.Color.dark_red())
+    embed.add_field(name="Suspects", value=", ".join(suspect_names), inline=False)
+    embed.set_footer(text="Vote with ?guesswhodunit @user once you've decided -- reveal the answer with ?revealwhodunit")
+    await ctx.send(embed=embed)
+
+    active_whodunits[ctx.channel.id] = {
+        "murderer_id": murderer.id,
+        "suspects": {m.id for m in suspects},
+        "guessed_correctly": set(),
+        "resolved": False,
+    }
+
+@bot.command(name="guesswhodunit", usage="@user", help="Guess who committed the murder in the active ?whodunit round in this channel.")
+async def guess_whodunit(ctx, member: discord.Member):
+    game = active_whodunits.get(ctx.channel.id)
+    if not game or game.get("resolved"):
+        return await ctx.send("📭 No active whodunit round in this channel. Start one with `?whodunit`.")
+    if member.id not in game["suspects"]:
+        return await ctx.send("❌ That person isn't one of the suspects in this round.")
+    if member.id == game["murderer_id"]:
+        game["guessed_correctly"].add(ctx.author.id)
+        await ctx.send(f"🎯 {ctx.author.mention}, your instincts are noted. (Keep it to yourself until `?revealwhodunit`!)")
+    else:
+        await ctx.send(f"❌ Nope, not {member.display_name}. Keep investigating!")
+
+@bot.command(name="revealwhodunit", help="Reveals who the murderer actually was in the active ?whodunit round, and who guessed correctly.")
+async def reveal_whodunit(ctx):
+    game = active_whodunits.get(ctx.channel.id)
+    if not game or game.get("resolved"):
+        return await ctx.send("📭 No active whodunit round to reveal in this channel.")
+    game["resolved"] = True
+
+    murderer = ctx.guild.get_member(game["murderer_id"])
+    correct_guessers = [f"<@{uid}>" for uid in game["guessed_correctly"]]
+    description = f"🔪 The culprit was... **{murderer.display_name if murderer else 'someone who has since left'}**!\n\n"
+    description += f"🏆 Correct guessers: {', '.join(correct_guessers)}" if correct_guessers else "🤷 Nobody guessed it!"
+
+    embed = discord.Embed(title="🕵️ Case Closed", description=description, color=discord.Color.gold())
+    if murderer:
+        embed.set_thumbnail(url=murderer.display_avatar.url)
+    await ctx.send(embed=embed)
+    active_whodunits.pop(ctx.channel.id, None)
+
+# --------------------------------------------------------
+# 🔗 WORD CHAIN
+# --------------------------------------------------------
+@bot.command(name="wordchain", aliases=["wc"], usage="[start|stop|status]", help="Word chain game: each message must start with the last word of the previous one. `?wordchain start` to begin, `?wordchain stop` to end. Best run in its own channel -- every message there gets checked while it's active.")
+async def wordchain_cmd(ctx, action: str = "status"):
+    action = action.lower()
+    cid = ctx.channel.id
+
+    if action == "start":
+        if cid in active_wordchains:
+            return await ctx.send(f"❌ A word chain is already active here! Current word to continue from: **{active_wordchains[cid]['last_word']}**")
+        try:
+            raw = await asyncio.to_thread(get_groq_text, "Give ONE single simple English noun, lowercase, no punctuation, nothing else -- to start a word-chain game.")
+            word = re.sub(r"[^a-z]", "", raw.strip().split()[0].lower()) or "apple"
+        except Exception:
+            word = random.choice(["apple", "dragon", "ocean", "guitar", "mountain", "forest", "rocket"])
+        active_wordchains[cid] = {"last_word": word, "length": 1, "used_words": {word}}
+        await ctx.send(f"🔗 **Word Chain started!** First word: **{word}**\nThe next message in this channel must *start* with that word. `?wordchain stop` to end.")
+    elif action == "stop":
+        game = active_wordchains.pop(cid, None)
+        if not game:
+            return await ctx.send("❌ No active word chain here.")
+        await ctx.send(f"🛑 Word chain ended! Final streak: **{game['length']}** words.")
+    else:
+        game = active_wordchains.get(cid)
+        if not game:
+            return await ctx.send("📭 No active word chain in this channel. Start one with `?wordchain start`.")
+        await ctx.send(f"🔗 Current streak: **{game['length']}**. Next message must start with: **{game['last_word']}**")
+
 
 class HelpView(ui.View):
     def __init__(self, bot, author):
@@ -8101,6 +8493,7 @@ class HelpView(ui.View):
         embed.add_field(name="`?unjail @user`", value="Releases a jailed member.", inline=False)
         embed.add_field(name="`?undo`", value="Reverses the last undoable moderation action on this server -- purge, warn, timeout, ban, kick, jail, lock/unlock, or `?resetlb`. Works for both `?commands` and the control channel.", inline=False)
         embed.add_field(name="`?resetlb @user` (`?resetleaderboard`)", value="Resets a specific user's weekly leaderboard message count to zero.", inline=False)
+        embed.add_field(name="`?curse @user [hours]`", value="Instantly slaps a random cursed temp role on someone for laughs. Default 3 hours, max 1 week.", inline=False)
         return embed
 
     def get_warnings_page(self, embed):
@@ -8131,6 +8524,9 @@ class HelpView(ui.View):
         embed.add_field(name="`?resizepfp` (attach an image)", value="Fits an attached image into Discord's square avatar shape with no cropping and no stretching -- fills the leftover space with a blurred version of the same image instead of a blank background. Works in DM too.", inline=False)
         embed.add_field(name="`?dmbot <server_id> [channel_id]` / `?dmbot off`", value="Run in DM with the bot (server Administrators only): everything you DM the bot afterward gets posted into that server's channel.", inline=False)
         embed.add_field(name="`?welcometest`", value="[Mods only] Fires a test welcome message in the configured welcome channel.", inline=False)
+        embed.add_field(name="`?snipe`", value="Shows the most recently deleted message in this channel.", inline=False)
+        embed.add_field(name="`?editsnipe` (`?esnipe`)", value="Shows the most recently edited message in this channel (before → after).", inline=False)
+        embed.add_field(name="`?firstmessage` (`?fm`) `[user]`", value="Jumps to the first message in this channel, or the first message a specific user sent here.", inline=False)
         return embed
 
     def get_ai_page(self, embed):
@@ -8178,6 +8574,7 @@ class HelpView(ui.View):
         embed.add_field(name="`?profile [user]`", value="View message count, reputation, and earned badges.", inline=False)
         embed.add_field(name="`?badges [user]`", value="See all achievement badges a user has earned.", inline=False)
         embed.add_field(name="`?leaderboard` (`?lb`)", value="Top 10 chatters this week.", inline=False)
+        embed.add_field(name="`?vcmvp` (`?vclb`)", value="Top 10 voice-chat time rankings this week -- same weekly reset and a matching temporary role, just for VC time instead of messages.", inline=False)
         embed.add_field(name="`?wish @user`", value="Give a member a birthday role + announcement (mods only).", inline=False)
         embed.add_field(name="`?addbday <day> <month> <year>`", value="Register your birthday -- the bot auto-celebrates it at midnight IST with an AI-personalized announcement, DM, image, and a one-day custom role.", inline=False)
         embed.add_field(name="`?activatebday`", value="[Mods only] Instantly run the full birthday celebration for yourself right now, for demo/testing.", inline=False)
@@ -8257,6 +8654,8 @@ class HelpView(ui.View):
         embed.add_field(name="`?wyr`", value="AI-generated 'Would You Rather' -- react 🅰️ or 🅱️ to vote, hit Next Question to keep going.", inline=False)
         embed.add_field(name="`?truthordare` (`?tod`) `[@user]`", value="Truth or Dare -- the target picks Truth or Dare via buttons, AI generates one, and a Next button keeps the round going.", inline=False)
         embed.add_field(name="`?whowouldyou` (`?wwy`)", value="Picks two random real members of this server -- react 🅰️ or 🅱️ to vote for who you'd choose. Whoever gets fewer votes gets a cursed role for 24 hours. Keep going with Next Round.", inline=False)
+        embed.add_field(name="`?whodunit` / `?guesswhodunit @user` / `?revealwhodunit`", value="AI writes a murder-mystery starring 4-5 random members -- read the clues, vote on who you think did it, then reveal the answer.", inline=False)
+        embed.add_field(name="`?wordchain` (`?wc`) `start|stop|status`", value="Word chain game: each message must start with the last word of the previous one. Best run in its own channel.", inline=False)
         return embed
 
     def get_owner_page(self, embed):
